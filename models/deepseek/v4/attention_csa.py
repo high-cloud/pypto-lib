@@ -149,14 +149,14 @@ def attention_csa(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
+    seqused_kv: pl.Tensor[[B, S], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     start_pos: pl.Scalar[pl.INT32],
 ):
-    compress_rem = (start_pos + S) % COMPRESS_RATIO
+    compress_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
 
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
@@ -203,8 +203,8 @@ def attention_csa(
         cmp_sin_base = pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0)
         cmp_cos = cmp_cos_base
         cmp_sin = cmp_sin_base
-        if start_pos + 1 >= COMPRESS_RATIO:
-            cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
+        if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
+            cmp_pos = pl.cast(start_pos + compress_offset - COMPRESS_RATIO, pl.INDEX)
             cmp_cos = pl.col_expand(
                 cmp_cos_base,
                 pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
@@ -273,7 +273,7 @@ def attention_csa(
         ROTATE_MAIN,
     )
 
-    if compress_rem == 0:
+    if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
         cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
         cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_cmp"):
@@ -399,7 +399,7 @@ def attention_csa_test_refresh(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
+    seqused_kv: pl.Tensor[[B, S], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -524,7 +524,7 @@ def golden_attention_csa(tensors):
         # Per-token gather + attention; token t belongs to batch t // S.
         for t in range(T):
             b = t // S
-            seq_used = int(seqused_kv[b].item())
+            seq_used = int(seqused_kv.view(T)[t].item())
             window_valid = min(WIN, seq_used)
             cmp_valid = max(seq_used - window_valid, 0)
             cmp_topk_valid = min(IDX_TOPK, cmp_valid)
@@ -608,9 +608,12 @@ def golden_attention_csa(tensors):
     rope_sin_t = freqs_sin[start_pos:start_pos + 1].expand(T, ROPE_HEAD_DIM).contiguous()
     step_cos = freqs_cos[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
     step_sin = freqs_sin[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
-    if start_pos + 1 >= COMPRESS_RATIO:
-        cmp_cos = freqs_cos[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
-        cmp_sin = freqs_sin[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
+    compress_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
+    should_compress = compress_offset <= S
+    if should_compress:
+        cmp_pos = start_pos + compress_offset - COMPRESS_RATIO
+        cmp_cos = freqs_cos[cmp_pos:cmp_pos + 1, :HALF_ROPE].contiguous()
+        cmp_sin = freqs_sin[cmp_pos:cmp_pos + 1, :HALF_ROPE].contiguous()
     else:
         cmp_cos = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
         cmp_sin = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
@@ -670,7 +673,7 @@ def golden_attention_csa(tensors):
         "start_pos": tensors["start_pos"],
         "rotate": False,
     })
-    if (start_pos + S) % COMPRESS_RATIO == 0:
+    if should_compress:
         cmp_slot_rel = start_pos // COMPRESS_RATIO
         for b in range(B):
             blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())
@@ -720,7 +723,7 @@ def golden_attention_csa(tensors):
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": sparse_topk,
         "attn_sink": tensors["attn_sink"],
-        "seqused_kv": tensors["seqused_kv"].view(B),
+        "seqused_kv": tensors["seqused_kv"].view(B, S),
         "freqs_cos": rope_cos_t,
         "freqs_sin": rope_sin_t,
         "even_select_local": tensors["even_select_local"],
@@ -925,9 +928,12 @@ def build_tensor_specs():
         return torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
 
     def init_seqused_kv():
-        win_valid = min(WIN, START_POS + S)
-        cmp_valid = (START_POS + S) // COMPRESS_RATIO
-        return torch.full((B,), win_valid + cmp_valid, dtype=torch.int32)
+        seq = torch.empty((B, S), dtype=torch.int32)
+        for b in range(B):
+            for s in range(S):
+                kv_len = START_POS + s + 1
+                seq[b, s] = kv_len if kv_len <= WIN else WIN + kv_len // COMPRESS_RATIO
+        return seq
 
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
@@ -1011,7 +1017,7 @@ def build_tensor_specs():
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("idx_kv_cache", [B, IDX_KV_LEN, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_idx_kv_cache.clone()),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
+        TensorSpec("seqused_kv", [B, S], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),

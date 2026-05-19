@@ -111,7 +111,7 @@ def attention_hca(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
+    seqused_kv: pl.Tensor[[B, S], pl.INT32],
     # o_proj (fused into sparse_attn)
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -123,7 +123,7 @@ def attention_hca(
     """HCA decode orchestration for compress_ratio=128. Caller contract:
     runtime ``start_pos`` MUST equal compile-time ``START_POS``.
     """
-    compress_rem = (start_pos + S) % COMPRESS_RATIO
+    compress_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
 
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
@@ -160,11 +160,11 @@ def attention_hca(
     # negative table row.
     cmp_cos = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    if start_pos + 1 >= COMPRESS_RATIO:
+    if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
             cmp_cos_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
             cmp_sin_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-            cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
+            cmp_pos = pl.cast(start_pos + compress_offset - COMPRESS_RATIO, pl.INDEX)
             cmp_cos = pl.col_expand(
                 cmp_cos_base,
                 pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
@@ -248,7 +248,7 @@ def attention_hca(
 
     # cmp_kv scatter only happens on compression steps. Non-compression steps
     # update compressor state but keep the existing compressed cache intact.
-    if compress_rem == 0:
+    if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
         cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
         cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
         cmp_kv_buf_flat = pl.reshape(cmp_kv_buf, [B * IDX_KV_LEN, HEAD_DIM])
@@ -352,7 +352,7 @@ def attention_hca_test(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
+    seqused_kv: pl.Tensor[[B, S], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -411,7 +411,8 @@ def golden_attention_hca(tensors):
     win = WIN
     ratio = COMPRESS_RATIO
     rd = ROPE_HEAD_DIM
-    should_compress = ((start_pos + 1) % ratio) == 0
+    compress_offset = ratio - (start_pos % ratio)
+    should_compress = compress_offset <= S
 
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
@@ -420,9 +421,10 @@ def golden_attention_hca(tensors):
     rope_cos_T = step_cos.expand(T, rd).contiguous()
     rope_sin_T = step_sin.expand(T, rd).contiguous()
     half_rd = rd // 2
-    if start_pos + 1 >= ratio:
-        cmp_cos = freqs_cos[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]   # ratio128 compressor: half-vec [1, rd//2]
-        cmp_sin = freqs_sin[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]
+    if should_compress:
+        cmp_pos = start_pos + compress_offset - ratio
+        cmp_cos = freqs_cos[cmp_pos:cmp_pos + 1, :half_rd]   # ratio128 compressor: half-vec [1, rd//2]
+        cmp_sin = freqs_sin[cmp_pos:cmp_pos + 1, :half_rd]
     else:
         cmp_cos = torch.zeros(1, half_rd, dtype=torch.bfloat16)
         cmp_sin = torch.zeros(1, half_rd, dtype=torch.bfloat16)
@@ -454,7 +456,7 @@ def golden_attention_hca(tensors):
     topk_idxs = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
     topk_idxs[:, :win] = torch.arange(win, dtype=torch.int32)
     offset = win
-    cache_len = (start_pos + 1) // ratio
+    cache_len = (start_pos + seqlen) // ratio
     if cache_len > 0:
         k = min(cache_len, CMP_TOPK)
         topk_idxs[:, win:win + k] = torch.arange(k, dtype=torch.int32) + offset
@@ -514,7 +516,7 @@ def golden_attention_hca(tensors):
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": topk_idxs,
         "attn_sink": tensors["attn_sink"],
-        "seqused_kv": tensors["seqused_kv"].view(B),
+        "seqused_kv": tensors["seqused_kv"].view(B, S),
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
         "even_select_local": tensors["even_select_local"],
@@ -655,11 +657,12 @@ def build_tensor_specs():
         return torch.zeros(H)
     def init_seqused_kv():
         # sparse_attn uses: window_valid = min(WIN, seq_used); cmp_valid = seq_used - window_valid.
-        # HCA at start_pos with S new tokens: window has min(WIN, start_pos+S) valid entries,
-        # cmp pool has (start_pos+S)//ratio compressed slots written.
-        win_valid = min(WIN, START_POS + S)
-        cmp_valid = (START_POS + S) // COMPRESS_RATIO
-        return torch.full((B,), win_valid + cmp_valid, dtype=torch.int32)
+        seq = torch.empty((B, S), dtype=torch.int32)
+        for b in range(B):
+            for s in range(S):
+                kv_len = START_POS + s + 1
+                seq[b, s] = kv_len if kv_len <= WIN else WIN + kv_len // COMPRESS_RATIO
+        return seq
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
@@ -702,7 +705,7 @@ def build_tensor_specs():
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
+        TensorSpec("seqused_kv", [B, S], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
