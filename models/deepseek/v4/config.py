@@ -254,10 +254,10 @@ C4A_COMPRESSOR_BLOCK_SIZE = 4             # ratio-4 compressor state page size
 C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
 LM_HEAD_TP_SIZE = 8
 
-# Static paged-cache pools shared by decode and prefill kernels. Prefill uses a
-# decode-batch-sized physical pool because serving slot ids address the shared
-# decode KV-cache layout even when a prefill kernel handles one request at a time.
-KV_ORI_MAX_BLOCKS = 1
+# Static paged-cache pools shared by decode and prefill kernels. Decode keeps
+# enough original-KV pages to express physical SWA slots for the default 8k
+# decode fixture; HCA/CSA still use their legacy ring window mapping.
+KV_ORI_MAX_BLOCKS = (DECODE_START_POS + DECODE_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
 KV_CMP_MAX_BLOCKS = 32
 IDX_CACHE_MAX_BLOCKS = 64
 DECODE_ORI_BLOCK_NUM = DECODE_BATCH * KV_ORI_MAX_BLOCKS
