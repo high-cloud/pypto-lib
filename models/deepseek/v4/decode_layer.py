@@ -114,6 +114,8 @@ def decode_layer(
     kv_cache: pl.InOut[pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    window_swa_indices: pl.Tensor[[T, SWA_WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T], pl.INT32],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[T, SWA_WIN], pl.INT32],
     swa_lens: pl.Tensor[[T], pl.INT32],
@@ -212,8 +214,9 @@ def decode_layer(
             wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
             hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
             hca_compress_state, hca_compress_state_block_table,
-            kv_cache, block_table, cmp_kv, cmp_block_table,
-            ori_slot_mapping, hca_cmp_slot_mapping, hca_state_slot_mapping,
+            kv_cache, cmp_kv, cmp_block_table,
+            ori_slot_mapping, window_swa_indices, window_swa_lens,
+            hca_cmp_slot_mapping, hca_state_slot_mapping,
             position_ids, kv_seq_lens,
             attn_sink, wo_a, wo_b, wo_b_scale,
             x_attn,
@@ -229,9 +232,10 @@ def decode_layer(
             csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx,
             csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
             csa_inner_compress_state, csa_inner_compress_state_block_table,
-            kv_cache, block_table, cmp_kv, cmp_block_table,
+            kv_cache, cmp_kv, cmp_block_table,
             idx_kv_cache, idx_block_table,
-            ori_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping,
+            ori_slot_mapping, window_swa_indices, window_swa_lens,
+            csa_cmp_slot_mapping, csa_idx_slot_mapping,
             csa_state_slot_mapping, csa_inner_state_slot_mapping,
             position_ids, kv_seq_lens,
             attn_sink, wo_a, wo_b, wo_b_scale,
@@ -273,6 +277,8 @@ def l3_decode_layer(
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[N_RANKS, B, ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    window_swa_indices: pl.Tensor[[N_RANKS, T, SWA_WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
     swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     swa_indices: pl.Tensor[[N_RANKS, T, SWA_WIN], pl.INT32],
     swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
@@ -369,6 +375,7 @@ def l3_decode_layer(
             wkv[r], gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r],
             kv_cache[r], block_table[r],
             ori_slot_mapping[r],
+            window_swa_indices[r], window_swa_lens[r],
             swa_slot_mapping[r],
             swa_indices[r], swa_lens[r],
             hca_cmp_slot_mapping[r], hca_state_slot_mapping[r],
@@ -420,6 +427,8 @@ def golden_decode_layer(tensors):
             "kv_cache": tensors["kv_cache"][r],
             "block_table": tensors["block_table"][r],
             "ori_slot_mapping": tensors["ori_slot_mapping"][r],
+            "window_swa_indices": tensors["window_swa_indices"][r],
+            "window_swa_lens": tensors["window_swa_lens"][r],
             "swa_slot_mapping": tensors["swa_slot_mapping"][r],
             "swa_indices": tensors["swa_indices"][r],
             "swa_lens": tensors["swa_lens"][r],
@@ -465,10 +474,11 @@ def golden_decode_layer_hca(tensors):
             "compress_state": tensors["compress_state"][r],
             "compress_state_block_table": tensors["compress_state_block_table"][r],
             "kv_cache": tensors["kv_cache"][r],
-            "ori_block_table": tensors["ori_block_table"][r],
             "cmp_kv": tensors["cmp_kv"][r],
             "cmp_block_table": tensors["cmp_block_table"][r],
             "ori_slot_mapping": tensors["ori_slot_mapping"][r],
+            "window_swa_indices": tensors["window_swa_indices"][r],
+            "window_swa_lens": tensors["window_swa_lens"][r],
             "cmp_slot_mapping": tensors["cmp_slot_mapping"][r],
             "state_slot_mapping": tensors["state_slot_mapping"][r],
             "position_ids": tensors["position_ids"][r],
@@ -522,12 +532,13 @@ def golden_decode_layer_csa(tensors):
             "inner_compress_state": tensors["inner_compress_state"][r],
             "inner_compress_state_block_table": tensors["inner_compress_state_block_table"][r],
             "kv_cache": tensors["kv_cache"][r],
-            "ori_block_table": tensors["ori_block_table"][r],
             "cmp_kv": tensors["cmp_kv"][r],
             "cmp_block_table": tensors["cmp_block_table"][r],
             "idx_kv_cache": tensors["idx_kv_cache"][r],
             "idx_block_table": tensors["idx_block_table"][r],
             "ori_slot_mapping": tensors["ori_slot_mapping"][r],
+            "window_swa_indices": tensors["window_swa_indices"][r],
+            "window_swa_lens": tensors["window_swa_lens"][r],
             "cmp_slot_mapping": tensors["cmp_slot_mapping"][r],
             "idx_slot_mapping": tensors["idx_slot_mapping"][r],
             "state_slot_mapping": tensors["state_slot_mapping"][r],
@@ -562,7 +573,6 @@ def golden_decode_layer_auto(tensors):
             "compress_state_block_table": tensors["hca_compress_state_block_table"],
             "cmp_slot_mapping": tensors["hca_cmp_slot_mapping"],
             "state_slot_mapping": tensors["hca_state_slot_mapping"],
-            "ori_block_table": tensors["block_table"],
         })
         golden_decode_layer_hca(mapped)
     else:
@@ -588,7 +598,6 @@ def golden_decode_layer_auto(tensors):
             "idx_slot_mapping": tensors["csa_idx_slot_mapping"],
             "state_slot_mapping": tensors["csa_state_slot_mapping"],
             "inner_state_slot_mapping": tensors["csa_inner_state_slot_mapping"],
-            "ori_block_table": tensors["block_table"],
         })
         golden_decode_layer_csa(mapped)
 
@@ -627,6 +636,7 @@ def _attention_kind_for_layer(layer_id):
 
 def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     import torch
+    from decode_metadata import block_table
     from golden import ScalarSpec, TensorSpec
 
     _validate_layer_id(layer_id)
@@ -654,6 +664,9 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         "hca": hca_specs,
         "csa": csa_specs,
     }[attention_kind]
+
+    def init_block_table():
+        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
 
     replicated_attention = {
         "hc_attn_fn",
@@ -704,8 +717,10 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         ("freqs_cos", swa_specs["freqs_cos"]),
         ("freqs_sin", swa_specs["freqs_sin"]),
         ("kv_cache", swa_specs["kv_cache"]),
-        ("block_table", hca_specs["ori_block_table"]),
+        ("block_table", TensorSpec("block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_block_table)),
         ("ori_slot_mapping", active_specs.get("ori_slot_mapping", hca_specs["ori_slot_mapping"])),
+        ("window_swa_indices", hca_specs["window_swa_indices"]),
+        ("window_swa_lens", hca_specs["window_swa_lens"]),
         ("swa_slot_mapping", swa_specs["swa_slot_mapping"]),
         ("swa_indices", swa_specs["swa_indices"]),
         ("swa_lens", swa_specs["swa_lens"]),
