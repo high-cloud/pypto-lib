@@ -285,6 +285,16 @@ def lm_head(
                     tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
                     tl = src_vocab_base + tail_o0
                     logits[:, tl : tl + LOGITS_COMM_TAIL] = logits_window[:, tl : tl + LOGITS_COMM_TAIL]
+
+    # Every local wait has observed all current-round peer notifies before the
+    # logits gather can complete. Clear only this rank's counters so a retained
+    # CommDomain can safely reuse the fixed done_epoch on the next forward.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear"):
+        _completion_anchor = pl.read(logits, [0, 0])
+        zero = pl.cast(0, pl.INT32)
+        for src_tp in pl.range(TP_SIZE):
+            pl.write(hidden_done, [src_tp, 0], zero)
+            pl.write(logits_done, [src_tp, 0], zero)
     return logits
 
 
