@@ -15,7 +15,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_START_POS, FLASH as M
+from config import DECODE_SEQ, DECODE_START_POS, FLASH as M
 from decode_attention_swa import (
     B,
     BLOCK_SIZE,
@@ -37,6 +37,7 @@ from decode_attention_swa import (
     golden_attention_swa,
 )
 from decode_metadata_device import build_swa_metadata
+from decode_input_pack import pack_mtp_hidden
 from hc_head import golden_hc_head, hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
@@ -49,6 +50,7 @@ from lm_head import (
     golden_lm_head,
     lm_head_with_sampling,
 )
+from lookup_embedding import VOCAB_DYN as EMBED_VOCAB_DYN, lookup_embedding
 from moe import (
     AUX_PAD,
     D,
@@ -83,8 +85,11 @@ LM_HEAD_COMM_EPOCH = 1
 
 @pl.jit(auto_scope=False)
 def mtp_decode_layer(
-    hidden_states: pl.Tensor[[T, D], pl.BF16],
-    prev_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    embed_weight: pl.Tensor[[EMBED_VOCAB_DYN, D], pl.BF16],
+    main_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    tail_pre_hc_pool: pl.InOut[pl.Tensor[[B, HC_MULT, D], pl.FP32]],
+    accepted_counts: pl.Tensor[[B], pl.INT32],
+    tail_slot_ids: pl.Tensor[[B], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
@@ -159,6 +164,19 @@ def mtp_decode_layer(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+    hidden_states = pl.create_tensor([T, D], dtype=pl.BF16)
+    lookup_embedding(input_ids, embed_weight, hidden_states)
+    prev_pre_hc_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    fallback_hidden = main_pre_hc_hidden[0:DECODE_SEQ, 0:HC_MULT, 0:D]
+    pack_mtp_hidden(
+        main_pre_hc_hidden,
+        tail_pre_hc_pool,
+        accepted_counts,
+        tail_slot_ids,
+        fallback_hidden,
+        prev_pre_hc_hidden,
+    )
+
     swa_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
     swa_lens = pl.create_tensor([T], dtype=pl.INT32)
@@ -228,8 +246,11 @@ def mtp_decode_layer(
 
 @pl.jit.host
 def l3_mtp_decode_layer(
-    hidden_states: pl.Tensor[[N_RANKS, T, D], pl.BF16],
-    prev_pre_hc_hidden: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    embed_weight: pl.Tensor[[N_RANKS, EMBED_VOCAB_DYN, D], pl.BF16],
+    main_pre_hc_hidden: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    tail_pre_hc_pool: pl.InOut[pl.Tensor[[N_RANKS, B, HC_MULT, D], pl.FP32]],
+    accepted_counts: pl.Tensor[[N_RANKS, B], pl.INT32],
+    tail_slot_ids: pl.Tensor[[N_RANKS, B], pl.INT32],
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
     enorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     hnorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
@@ -318,7 +339,8 @@ def l3_mtp_decode_layer(
         lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
         lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         mtp_decode_layer(
-            hidden_states[r], prev_pre_hc_hidden[r], position_ids[r],
+            embed_weight[r], main_pre_hc_hidden[r], tail_pre_hc_pool[r],
+            accepted_counts[r], tail_slot_ids[r], position_ids[r],
             enorm_w[r], hnorm_w[r],
             e_proj_w[r], e_proj_w_scale[r], e_proj_smooth[r],
             h_proj_w[r], h_proj_w_scale[r], h_proj_smooth[r],
@@ -408,23 +430,47 @@ def _projection_specs():
             h_proj_cache = init_proj_pair()
         return h_proj_cache[1]
 
-    def init_hidden_states():
-        return torch.randn(N_RANKS, T, D).to(torch.bfloat16)
+    def init_embed_weight():
+        value = torch.randn(M.vocab_size, D).to(torch.bfloat16)
+        return value.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
-    def init_prev_pre_hc_hidden():
-        return torch.randn(N_RANKS, T, HC_MULT, D).to(torch.bfloat16)
+    def init_main_pre_hc_hidden():
+        return torch.randn(N_RANKS, T, HC_MULT, D)
+
+    def init_tail_pre_hc_pool():
+        return torch.randn(N_RANKS, B, HC_MULT, D)
+
+    def init_accepted_counts():
+        counts = torch.tensor([1, 2, 1, 2], dtype=torch.int32)
+        return counts.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+
+    def init_tail_slot_ids():
+        slots = torch.arange(B, dtype=torch.int32)
+        return slots.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
     def init_projection_ones():
         return torch.ones(N_RANKS, D)
 
     return {
-        "hidden_states": TensorSpec(
-            "hidden_states", [N_RANKS, T, D], torch.bfloat16,
-            init_value=init_hidden_states,
+        "embed_weight": TensorSpec(
+            "embed_weight", [N_RANKS, M.vocab_size, D], torch.bfloat16,
+            init_value=init_embed_weight, resident="stacked",
         ),
-        "prev_pre_hc_hidden": TensorSpec(
-            "prev_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32,
-            init_value=init_prev_pre_hc_hidden,
+        "main_pre_hc_hidden": TensorSpec(
+            "main_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32,
+            init_value=init_main_pre_hc_hidden,
+        ),
+        "tail_pre_hc_pool": TensorSpec(
+            "tail_pre_hc_pool", [N_RANKS, B, HC_MULT, D], torch.float32,
+            init_value=init_tail_pre_hc_pool, is_output=True,
+        ),
+        "accepted_counts": TensorSpec(
+            "accepted_counts", [N_RANKS, B], torch.int32,
+            init_value=init_accepted_counts,
+        ),
+        "tail_slot_ids": TensorSpec(
+            "tail_slot_ids", [N_RANKS, B], torch.int32,
+            init_value=init_tail_slot_ids,
         ),
         "enorm_w": TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=init_projection_ones),
         "hnorm_w": TensorSpec("hnorm_w", [N_RANKS, D], torch.float32, init_value=init_projection_ones),
@@ -524,7 +570,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         "attn_sink", "wo_a", "wo_b", "wo_b_scale",
     }
     ordered_names = [
-        "hidden_states", "prev_pre_hc_hidden", "position_ids",
+        "embed_weight", "main_pre_hc_hidden", "tail_pre_hc_pool",
+        "accepted_counts", "tail_slot_ids", "position_ids",
         "enorm_w", "hnorm_w",
         "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
         "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
@@ -634,11 +681,37 @@ def golden_mtp_decode_layer(tensors):
     from decode_metadata import paged_slot_mapping, swa_indices_and_lens
 
     num_tokens = int(tensors["num_tokens"])
-    projected = torch.empty_like(tensors["prev_pre_hc_hidden"])
+    hidden_states = torch.empty(
+        N_RANKS, T, D, dtype=torch.bfloat16
+    )
+    prev_pre_hc_hidden = torch.empty_like(tensors["main_pre_hc_hidden"])
+    for rank in range(N_RANKS):
+        hidden_states[rank] = tensors["embed_weight"][rank].index_select(
+            0, tensors["input_ids"][rank].long()
+        )
+        fallback_hidden = tensors["main_pre_hc_hidden"][rank, :DECODE_SEQ]
+        for batch_idx in range(B):
+            row0 = batch_idx * DECODE_SEQ
+            row1 = row0 + 1
+            slot = int(tensors["tail_slot_ids"][rank, batch_idx])
+            if slot < 0:
+                prev_pre_hc_hidden[rank, row0 : row1 + 1] = fallback_hidden
+                continue
+            accepted_count = int(tensors["accepted_counts"][rank, batch_idx])
+            last_row = row0 + accepted_count - 1
+            if accepted_count == 1:
+                prev_pre_hc_hidden[rank, row0] = tensors["tail_pre_hc_pool"][rank, slot]
+            else:
+                prev_pre_hc_hidden[rank, row0] = tensors["main_pre_hc_hidden"][rank, row0]
+            last_hidden = tensors["main_pre_hc_hidden"][rank, last_row]
+            prev_pre_hc_hidden[rank, row1] = last_hidden
+            tensors["tail_pre_hc_pool"][rank, slot] = last_hidden
+
+    projected = torch.empty_like(prev_pre_hc_hidden)
     for rank in range(N_RANKS):
         projection_tensors = {
-            "hidden_states": tensors["hidden_states"][rank],
-            "prev_hidden_states": tensors["prev_pre_hc_hidden"][rank],
+            "hidden_states": hidden_states[rank],
+            "prev_hidden_states": prev_pre_hc_hidden[rank],
             "enorm_w": tensors["enorm_w"][rank],
             "hnorm_w": tensors["hnorm_w"][rank],
             "e_proj_w": tensors["e_proj_w"][rank],

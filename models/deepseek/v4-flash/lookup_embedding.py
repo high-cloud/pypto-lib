@@ -27,7 +27,7 @@ SPMD_BLOCKS = 48
 
 @pl.jit.inline
 def lookup_embedding(
-    input_ids: pl.Tensor[[T_DYN], pl.INT32],
+    input_ids: pl.Tensor[[T_DYN], pl.INT64],
     embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
 ) -> pl.Tensor[[T_DYN, D], pl.BF16]:
@@ -48,7 +48,7 @@ def lookup_embedding(
 
 @pl.jit
 def lookup_embedding_test(
-    input_ids: pl.Tensor[[T_DYN], pl.INT32],
+    input_ids: pl.Tensor[[T_DYN], pl.INT64],
     embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
     hidden_states: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ) -> pl.Tensor[[T_DYN, D], pl.BF16]:
@@ -69,7 +69,7 @@ def build_tensor_specs(token_count, vocab_size):
     from golden import TensorSpec
 
     def init_input_ids():
-        sample_ids = torch.tensor([0, 1, 17, vocab_size - 1, 17, 2, vocab_size // 2, 1], dtype=torch.int32)
+        sample_ids = torch.tensor([0, 1, 17, vocab_size - 1, 17, 2, vocab_size // 2, 1], dtype=torch.int64)
         repeats = (token_count + sample_ids.numel() - 1) // sample_ids.numel()
         return sample_ids.repeat(repeats)[:token_count].contiguous()
 
@@ -77,7 +77,7 @@ def build_tensor_specs(token_count, vocab_size):
         return torch.randn(vocab_size, D, dtype=torch.bfloat16)
 
     return [
-        TensorSpec("input_ids", [token_count], torch.int32, init_value=init_input_ids),
+        TensorSpec("input_ids", [token_count], torch.int64, init_value=init_input_ids),
         TensorSpec("embed_weight", [vocab_size, D], torch.bfloat16, init_value=init_embed_weight),
         TensorSpec("hidden_states", [token_count, D], torch.bfloat16, is_output=True),
     ]

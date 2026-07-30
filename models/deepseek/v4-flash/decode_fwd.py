@@ -89,6 +89,7 @@ from decode_attention_csa import (
     build_tensor_specs as build_csa_tensor_specs,
 )
 from config import DECODE_START_POS, FLASH as MODEL_CONFIG
+from decode_input_pack import VOCAB_DYN as EMBED_VOCAB_DYN, pack_x_hc
 from decode_metadata_device import N_CACHE_GROUPS, build_decode_metadata
 from moe import (
     AUX_PAD,
@@ -141,7 +142,6 @@ HCA_LAYER_STACKED_NAMES = [
 
 LAYER_STACKED_NAMES = ['attn_norm_w', 'attn_sink', 'cmp_kv', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_cmp_wgate', 'csa_cmp_wkv', 'csa_compress_state', 'csa_hadamard_idx', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_inner_ape', 'csa_inner_compress_state', 'csa_inner_norm_w', 'csa_inner_wgate', 'csa_inner_wkv', 'csa_weights_proj', 'gamma_ckv', 'gamma_cq', 'gate_bias', 'gate_w', 'hc_attn_base', 'hc_attn_fn', 'hc_attn_scale', 'hc_ffn_base', 'hc_ffn_fn', 'hc_ffn_scale', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_cmp_wgate', 'hca_cmp_wkv', 'hca_compress_state', 'idx_kv_cache', 'idx_kv_scale', 'kv_cache', 'norm_w', 'routed_w1', 'routed_w1_scale', 'routed_w2', 'routed_w2_scale', 'routed_w3', 'routed_w3_scale', 'shared_w1', 'shared_w1_scale', 'shared_w2', 'shared_w2_scale', 'shared_w3', 'shared_w3_scale', 'tid2eid', 'wkv', 'wo_a', 'wo_b', 'wo_b_scale', 'wq_a', 'wq_b', 'wq_b_scale']
 SHARED_NAMES = [
-    "x_hc",
     "block_table",
     "cmp_block_table",
     "csa_compress_state_block_table",
@@ -183,6 +183,7 @@ RESIDENT_WEIGHT_NAMES = frozenset(
         if n not in CACHE_POOL_NAMES
     ]
     + ["freqs_cos", "freqs_sin"]
+    + ["embed_weight"]
     + HC_HEAD_NAMES
     + FINAL_NORM_NAMES
 )
@@ -195,7 +196,7 @@ RESIDENT_CACHE_OUTPUT_NAMES = CACHE_POOL_NAMES
 
 @pl.jit(auto_scope=False)
 def decode_fwd(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    embed_weight: pl.Tensor[[EMBED_VOCAB_DYN, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -321,6 +322,9 @@ def decode_fwd(
         csa_state_slot_mapping,
         csa_inner_state_slot_mapping,
     )
+    x_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    pack_x_hc(input_ids, embed_weight, x_hc)
+
     nt = pl.cast(0, pl.INT32)
     for owner_rank in pl.range(N_RANKS):
         nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
@@ -724,7 +728,7 @@ def decode_fwd(
 
 @pl.jit.host
 def l3_decode_fwd(
-    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    embed_weight: pl.Tensor[[N_RANKS, EMBED_VOCAB_DYN, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -838,7 +842,7 @@ def l3_decode_fwd(
         lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
         lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         decode_fwd(
-            x_hc[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r],
+            embed_weight[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r],
             wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r], kv_cache[r], attn_sink[r],
             wo_a[r], wo_b[r], wo_b_scale[r], hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
             hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r], csa_cmp_wgate[r],
@@ -1452,10 +1456,20 @@ def build_tensor_specs(
         cmp_block_num=cmp_block_num,
         idx_block_num=idx_block_num,
     )
-    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'block_counts', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
+    ordered_names = ['embed_weight', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'block_counts', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
     specs = []
     for name in ordered_names:
-        if name in metadata_specs:
+        if name == "embed_weight":
+            embed_weight = torch.randn(MODEL_CONFIG.vocab_size, D, dtype=torch.bfloat16)
+            specs.append(TensorSpec(
+                name,
+                [N_RANKS, MODEL_CONFIG.vocab_size, D],
+                torch.bfloat16,
+                init_value=lambda value=embed_weight: value.unsqueeze(0).expand(
+                    N_RANKS, -1, -1
+                ).contiguous(),
+            ))
+        elif name in metadata_specs:
             specs.append(metadata_specs[name])
         elif name in CSA_LAYER_STACKED_NAMES:
             specs.append(_make_layer_stacked_spec(name, base_specs, CSA_NUM_LAYERS))

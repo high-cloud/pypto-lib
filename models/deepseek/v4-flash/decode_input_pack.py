@@ -29,7 +29,7 @@ assert D % MTP_HIDDEN_TILE == 0
 
 @pl.jit.inline
 def pack_x_hc(
-    input_ids: pl.Tensor[[DECODE_TOKENS], pl.INT32],
+    input_ids: pl.Tensor[[DECODE_TOKENS], pl.INT64],
     embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
     x_hc: pl.Tensor[[DECODE_TOKENS, HC_MULT, D], pl.FP32],
 ) -> pl.Tensor[[DECODE_TOKENS, HC_MULT, D], pl.FP32]:
