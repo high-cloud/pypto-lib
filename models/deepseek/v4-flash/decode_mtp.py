@@ -17,6 +17,7 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import DECODE_START_POS, FLASH as M
 from decode_attention_swa import (
+    B,
     BLOCK_SIZE,
     HEAD_DIM,
     H,
@@ -26,6 +27,7 @@ from decode_attention_swa import (
     O_LORA,
     ORI_BLOCK_NUM,
     ORI_BLOCK_NUM_DYN,
+    ORI_TABLE_MAX_BLOCKS,
     Q_LORA,
     ROPE_HEAD_DIM,
     T,
@@ -34,15 +36,18 @@ from decode_attention_swa import (
     build_tensor_specs as build_swa_tensor_specs,
     golden_attention_swa,
 )
+from decode_metadata_device import build_swa_metadata
 from hc_head import golden_hc_head, hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
     MAX_LOGIT_ROWS,
+    SAMPLED_IDS_PAD,
     TP_SIZE as LM_HEAD_TP_SIZE,
     VOCAB as LM_HEAD_VOCAB,
     VOCAB_PER_TP,
+    compare_sampled_ids,
     golden_lm_head,
-    lm_head,
+    lm_head_with_sampling,
 )
 from moe import (
     AUX_PAD,
@@ -102,9 +107,7 @@ def mtp_decode_layer(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    swa_slot_mapping: pl.Tensor[[T], pl.INT64],
-    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    swa_lens: pl.Tensor[[T], pl.INT32],
+    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -138,6 +141,9 @@ def mtp_decode_layer(
     hidden_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     next_pre_hc_hidden: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[
+        pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
+    ],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -153,6 +159,16 @@ def mtp_decode_layer(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+    swa_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
+    swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
+    swa_lens = pl.create_tensor([T], dtype=pl.INT32)
+    build_swa_metadata(
+        position_ids,
+        ori_block_table,
+        swa_slot_mapping,
+        swa_indices,
+        swa_lens,
+    )
     projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
         mtp_projection(
@@ -199,8 +215,9 @@ def mtp_decode_layer(
     with pl.scope():
         hc_head(next_pre_hc_hidden, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
         rms_norm(x_head, mtp_norm_w, hidden_out)
-        lm_head(
+        lm_head_with_sampling(
             hidden_out, lm_head_weight, logit_row_indices, logits,
+            sampled_ids,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
             my_rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE,
@@ -235,9 +252,7 @@ def l3_mtp_decode_layer(
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    swa_indices: pl.Tensor[[N_RANKS, T, WIN], pl.INT32],
-    swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
+    ori_block_table: pl.Tensor[[N_RANKS, B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
@@ -270,6 +285,9 @@ def l3_mtp_decode_layer(
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     next_pre_hc_hidden: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[
+        pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
+    ],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -309,7 +327,7 @@ def l3_mtp_decode_layer(
             wq_a[r], wq_b[r], wq_b_scale[r],
             wkv[r], gamma_cq[r], gamma_ckv[r],
             freqs_cos[r], freqs_sin[r],
-            kv_cache[r], swa_slot_mapping[r], swa_indices[r], swa_lens[r],
+            kv_cache[r], ori_block_table[r],
             attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r],
@@ -320,7 +338,7 @@ def l3_mtp_decode_layer(
             shared_w2[r], shared_w2_scale[r],
             mtp_hc_head_fn[r], mtp_hc_head_scale[r], mtp_hc_head_base[r], mtp_norm_w[r],
             lm_head_weight[r], logit_row_indices[r],
-            hidden_out[r], next_pre_hc_hidden[r], logits[r],
+            hidden_out[r], next_pre_hc_hidden[r], logits[r], sampled_ids[r],
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done,
@@ -328,7 +346,6 @@ def l3_mtp_decode_layer(
             r, num_tokens,
             device=r,
         )
-
 
 def _ranked_init(single_spec, *, replicated=False):
     import torch
@@ -488,6 +505,16 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         indices[:, :valid_rows] = torch.arange(valid_rows, dtype=torch.int32)
         return indices
 
+    def init_ori_block_table():
+        from decode_metadata import block_table
+
+        table = block_table(
+            batch=B,
+            table_blocks=ORI_TABLE_MAX_BLOCKS,
+            physical_blocks=ori_block_num,
+        )
+        return table.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
     replicated_attention = {
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
         "attn_norm_w",
@@ -506,8 +533,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         "wq_a", "wq_b", "wq_b_scale",
         "wkv", "gamma_cq", "gamma_ckv",
         "freqs_cos", "freqs_sin",
-        "kv_cache",
-        "swa_slot_mapping", "swa_indices", "swa_lens",
+        "kv_cache", "ori_block_table",
         "attn_sink", "wo_a", "wo_b", "wo_b_scale",
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
         "norm_w",
@@ -539,21 +565,13 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
                 init_value=init_kv_cache, is_output=swa_specs[name].is_output,
             )
             specs.append(cache_spec)
-        elif name in {"swa_slot_mapping", "swa_indices"}:
-            def init_dynamic_metadata(name=name):
-                values = []
-                for _ in range(N_RANKS):
-                    value = swa_specs[name].init_value().clone()
-                    valid = value >= 0
-                    value[valid] = value[valid].remainder(ori_block_num * BLOCK_SIZE)
-                    values.append(value)
-                return torch.stack(values, dim=0).contiguous()
-
-            metadata_spec = TensorSpec(
-                name, [N_RANKS, *swa_specs[name].shape], swa_specs[name].dtype,
-                init_value=init_dynamic_metadata, is_output=swa_specs[name].is_output,
-            )
-            specs.append(metadata_spec)
+        elif name == "ori_block_table":
+            specs.append(TensorSpec(
+                name,
+                [N_RANKS, B, ORI_TABLE_MAX_BLOCKS],
+                torch.int32,
+                init_value=init_ori_block_table,
+            ))
         else:
             ranked_spec = _ranked_spec(
                 name, swa_specs[name],
@@ -595,6 +613,13 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         is_output=True,
     )
     specs.append(logits_spec)
+    sampled_ids_spec = TensorSpec(
+        "sampled_ids",
+        [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
+        torch.int32,
+        is_output=True,
+    )
+    specs.append(sampled_ids_spec)
     row_indices_spec = TensorSpec(
         "logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32,
         init_value=init_logit_row_indices,
@@ -606,6 +631,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
 
 def golden_mtp_decode_layer(tensors):
     import torch
+    from decode_metadata import paged_slot_mapping, swa_indices_and_lens
 
     num_tokens = int(tensors["num_tokens"])
     projected = torch.empty_like(tensors["prev_pre_hc_hidden"])
@@ -625,6 +651,26 @@ def golden_mtp_decode_layer(tensors):
         }
         golden_mtp_projection(projection_tensors)
 
+    swa_slot_mapping = torch.empty((N_RANKS, T), dtype=torch.int64)
+    swa_indices = torch.empty((N_RANKS, T, WIN), dtype=torch.int32)
+    swa_lens = torch.empty((N_RANKS, T), dtype=torch.int32)
+    for rank in range(N_RANKS):
+        positions = tensors["position_ids"][rank].reshape(B, T // B)
+        table = tensors["ori_block_table"][rank]
+        swa_slot_mapping[rank] = paged_slot_mapping(
+            positions,
+            table,
+            block_size=BLOCK_SIZE,
+        ).reshape(-1)
+        rank_indices, rank_lens = swa_indices_and_lens(
+            positions,
+            table,
+            block_size=BLOCK_SIZE,
+            window=WIN,
+        )
+        swa_indices[rank] = rank_indices
+        swa_lens[rank] = rank_lens
+
     x_attn = torch.empty_like(projected)
     for rank in range(N_RANKS):
         attention_tensors = {
@@ -642,9 +688,9 @@ def golden_mtp_decode_layer(tensors):
             "freqs_cos": tensors["freqs_cos"][rank],
             "freqs_sin": tensors["freqs_sin"][rank],
             "kv_cache": tensors["kv_cache"][rank],
-            "swa_slot_mapping": tensors["swa_slot_mapping"][rank],
-            "swa_indices": tensors["swa_indices"][rank],
-            "swa_lens": tensors["swa_lens"][rank],
+            "swa_slot_mapping": swa_slot_mapping[rank],
+            "swa_indices": swa_indices[rank],
+            "swa_lens": swa_lens[rank],
             "position_ids": tensors["position_ids"][rank],
             "attn_sink": tensors["attn_sink"][rank],
             "wo_a": tensors["wo_a"][rank],
@@ -678,6 +724,7 @@ def golden_mtp_decode_layer(tensors):
         "lm_head_weight": tensors["lm_head_weight"],
         "logit_row_indices": tensors["logit_row_indices"],
         "logits": tensors["logits"],
+        "sampled_ids": tensors["sampled_ids"],
     }
     golden_lm_head(lm_head_tensors)
 
@@ -746,6 +793,7 @@ def main():
             "next_pre_hc_hidden": ratio_reldiff(diff_thd=0.02, pct_thd=0.05),
             "kv_cache": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
             "logits": ratio_reldiff(diff_thd=0.02, pct_thd=0.10),
+            "sampled_ids": compare_sampled_ids,
         },
     )
     if not result.passed:

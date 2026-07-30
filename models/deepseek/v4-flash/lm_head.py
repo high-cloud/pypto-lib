@@ -77,6 +77,14 @@ LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 FUSED_LM_HEAD_CORES = 24
 DONE_VALUE = 1
 
+# Greedy sampling uses exact 256-token chunks so the real vocabulary has no
+# padded tail. The 505 chunk maxima are padded to 512 for the final merge sort.
+GREEDY_VOCAB_CHUNK = 256
+GREEDY_NUM_VOCAB_CHUNKS = VOCAB // GREEDY_VOCAB_CHUNK
+GREEDY_CHUNK_PAD = 512
+GREEDY_TOPK = 16
+SAMPLED_IDS_PAD = 8
+
 # Combine blocks: one per vocab comm tile, capped at the core count; the tail tile
 # rides the block the strided loop hands it next. Raising the cap does not help --
 # the push is cross-card bandwidth bound, not core bound.
@@ -89,6 +97,8 @@ LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
 assert D % FUSED_K_TILE == 0
 assert D % HIDDEN_GATHER_TILE == 0
 assert VOCAB % TP_SIZE == 0
+assert VOCAB % GREEDY_VOCAB_CHUNK == 0
+assert GREEDY_NUM_VOCAB_CHUNKS <= GREEDY_CHUNK_PAD
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
 assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
@@ -320,11 +330,151 @@ def lm_head_test(
     return logits
 
 
+@pl.jit.inline
+def greedy_sample(
+    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    sampled_ids: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+):
+    """Select the first maximum token id from each full-vocabulary logits row."""
+    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_greedy_sample"):
+        chunk_idx_init = pl.arange(0, [1, GREEDY_VOCAB_CHUNK], dtype=pl.UINT32)
+        chunk_maxima = pl.create_tensor([1, GREEDY_CHUNK_PAD], dtype=pl.FP32)
+        chunk_maxima[:, :] = pl.full(
+            [1, GREEDY_CHUNK_PAD],
+            dtype=pl.FP32,
+            value=-3.402823e38,
+        )
+        for chunk in pl.range(GREEDY_NUM_VOCAB_CHUNKS):
+            chunk_start = chunk * GREEDY_VOCAB_CHUNK
+            scores = logits[
+                row : row + 1,
+                chunk_start : chunk_start + GREEDY_VOCAB_CHUNK,
+            ]
+            sorted_pairs = pl.sort32(scores, chunk_idx_init)
+            sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
+            sorted_pairs = pl.mrgsort(
+                sorted_pairs[:, 0:GREEDY_VOCAB_CHUNK],
+                sorted_pairs[:, GREEDY_VOCAB_CHUNK : 2 * GREEDY_VOCAB_CHUNK],
+            )
+            top_pair = sorted_pairs[:, 0 : 2 * GREEDY_TOPK]
+            top_values = pl.gather(top_pair, mask_pattern=pl.tile.MaskPattern.P0101)
+            pl.write(chunk_maxima, [0, chunk], pl.read(top_values, [0, 0]))
+
+        maxima_idx_init = pl.arange(0, [1, GREEDY_CHUNK_PAD], dtype=pl.UINT32)
+        sorted_maxima = pl.sort32(chunk_maxima, maxima_idx_init)
+        sorted_maxima = pl.mrgsort(sorted_maxima, block_len=64)
+        sorted_maxima = pl.mrgsort(sorted_maxima, block_len=256)
+        top_maximum_pair = sorted_maxima[:, 0 : 2 * GREEDY_TOPK]
+        top_maximum_values = pl.gather(
+            top_maximum_pair,
+            mask_pattern=pl.tile.MaskPattern.P0101,
+        )
+        best_value = pl.read(top_maximum_values, [0, 0])
+
+        # Reverse scans leave the lowest matching index selected, matching
+        # torch.argmax's first-occurrence tie behavior.
+        winning_chunk = pl.cast(0, pl.INT32)
+        for chunk in pl.range(GREEDY_NUM_VOCAB_CHUNKS):
+            scan_chunk = GREEDY_NUM_VOCAB_CHUNKS - 1 - chunk
+            if pl.read(chunk_maxima, [0, scan_chunk]) == best_value:
+                winning_chunk = pl.cast(scan_chunk, pl.INT32)
+
+        chunk_base = winning_chunk * pl.cast(GREEDY_VOCAB_CHUNK, pl.INT32)
+        winning_scores = pl.slice(
+            logits,
+            [1, GREEDY_VOCAB_CHUNK],
+            [pl.cast(row, pl.INDEX), pl.cast(chunk_base, pl.INDEX)],
+        )
+        winning_offset = pl.cast(0, pl.INT32)
+        for offset in pl.range(GREEDY_VOCAB_CHUNK):
+            scan_offset = GREEDY_VOCAB_CHUNK - 1 - offset
+            if pl.read(winning_scores, [0, scan_offset]) == best_value:
+                winning_offset = pl.cast(scan_offset, pl.INT32)
+        sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
+        sampled_row[:, :] = pl.full(
+            [1, SAMPLED_IDS_PAD],
+            dtype=pl.INT32,
+            value=0,
+        )
+        pl.write(sampled_row, [0, 0], chunk_base + winning_offset)
+        sampled_ids[row : row + 1, :] = sampled_row
+
+    return sampled_ids
+
+
+@pl.jit.inline(auto_scope=False)
+def lm_head_with_sampling(
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    done_epoch: pl.Scalar[pl.INT32],
+):
+    """Project logits and sample top-1 tokens in one opaque L2 entry."""
+    lm_head(
+        hidden_states,
+        lm_head_weight,
+        logit_row_indices,
+        logits,
+        hidden_window,
+        hidden_done,
+        logits_window,
+        logits_done,
+        group_base,
+        tp_rank,
+        done_epoch,
+    )
+    greedy_sample(logits, sampled_ids)
+    return logits, sampled_ids
+
+
+@pl.jit
+def lm_head_with_sampling_test(
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    done_epoch: pl.Scalar[pl.INT32],
+):
+    """Standalone opaque entry for projection plus greedy sampling tests."""
+    return lm_head_with_sampling(
+        hidden_states,
+        lm_head_weight,
+        logit_row_indices,
+        logits,
+        sampled_ids,
+        hidden_window,
+        hidden_done,
+        logits_window,
+        logits_done,
+        group_base,
+        tp_rank,
+        done_epoch,
+    )
+
+
 @pl.jit.host
 def l3_lm_head(
     hidden_states: pl.Tensor[[DP_SIZE, TEST_TOKENS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[DP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[
+        pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
+    ],
     logit_row_indices: pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
 ):
     # Windows are group-local: hidden_window holds one row slot per group member,
@@ -339,8 +489,9 @@ def l3_lm_head(
         hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
         logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_test(
+        lm_head_with_sampling_test(
             hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            sampled_ids[r],
             hidden_window, hidden_done, logits_window, logits_done,
             r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
         )
@@ -364,6 +515,12 @@ def golden_lm_head(tensors):
                 selected[row].copy_(hidden[owner_rank, source_row])
         full_logits.append(torch.matmul(selected, full_weight.t()))
     tensors["logits"][:] = torch.stack(full_logits, dim=0)
+    if "sampled_ids" in tensors:
+        tensors["sampled_ids"].zero_()
+        tensors["sampled_ids"][:, :, 0] = torch.argmax(
+            tensors["logits"],
+            dim=-1,
+        ).to(torch.int32)
 
 
 def build_tensor_specs(num_tokens=TEST_TOKENS):
@@ -408,6 +565,12 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             is_output=True,
         ),
         TensorSpec(
+            "sampled_ids",
+            [DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
+            torch.int32,
+            is_output=True,
+        ),
+        TensorSpec(
             "logit_row_indices",
             [DP_SIZE, MAX_LOGIT_ROWS],
             torch.int32,
@@ -435,6 +598,23 @@ def compare_logits(actual, expected, **_):
                 f"zeros={int((shard_actual == 0).sum())}"
             )
     return False, "\n".join(lines)
+
+
+def compare_sampled_ids(actual, _expected, *, actual_outputs, **_):
+    import torch
+
+    expected = torch.zeros_like(actual)
+    expected[:, :, 0] = torch.argmax(
+        actual_outputs["logits"].cpu(),
+        dim=-1,
+    ).to(torch.int32)
+    if torch.equal(actual, expected):
+        return True, ""
+    mismatch = actual != expected
+    return False, (
+        f"sampled_ids mismatch: bad={int(mismatch.sum())}/{actual.numel()} "
+        f"actual={actual.tolist()} expected={expected.tolist()}"
+    )
 
 
 if __name__ == "__main__":
@@ -470,7 +650,10 @@ if __name__ == "__main__":
     fn = l3_lm_head
     specs = build_tensor_specs(args.num_tokens)
     golden_fn = golden_lm_head
-    compare_fn = {"logits": compare_logits}
+    compare_fn = {
+        "logits": compare_logits,
+        "sampled_ids": compare_sampled_ids,
+    }
 
     result = run_jit(
         fn=fn,
