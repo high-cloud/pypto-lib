@@ -149,9 +149,9 @@ FWD_HCA_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_NUM_DYN")
 FWD_CSA_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
 FWD_INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
 
-# T // 2 active tokens need more than the runtime's default ring-2 heap while
-# the 43-layer prefill scope is open. Keep the other rings on their defaults.
-PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)
+# EP8 scope stats peak below 1 GiB on every ring after routed-expert W1/W3
+# intermediates are quantized per tile instead of retained as full INT32 tensors.
+PREFILL_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 # Replicated head weights (per-rank, not layer-stacked): hc_head projection and
 # the final RMSNorm gamma — mirrors decode_fwd.
