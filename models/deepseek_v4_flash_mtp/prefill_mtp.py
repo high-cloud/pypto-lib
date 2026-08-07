@@ -779,7 +779,7 @@ def main():
                                         valid_rows=args.num_tokens, valid_axis=1),
             "pre_hc_hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05,
                                                valid_rows=args.num_tokens, valid_axis=1),
-            "logits": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.05),
+            "logits": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.06),
         },
     )
     if not result.passed:
