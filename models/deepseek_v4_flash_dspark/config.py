@@ -244,6 +244,19 @@ DSPARK_SPEC_TOKENS = 7            # drafts the DSpark drafter proposes per reque
 DECODE_SEQ = 1 + DSPARK_SPEC_TOKENS  # S: tokens the target model verifies per step
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
+
+# DSpark drafter constants.  The drafter has seven logical query rows per
+# request, but kernels use an eighth, masked row so every supported batch stays
+# aligned to the existing eight-row HC/attention tiles.
+DSPARK_NUM_LAYERS = 3
+DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
+DSPARK_NOISE_TOKEN_ID = 128799
+DSPARK_MARKOV_RANK = 256
+DSPARK_QUERY_TOKENS = DSPARK_SPEC_TOKENS
+DSPARK_QUERY_TOKENS_PADDED = 8
+DSPARK_SWA_INDEX_WIDTH = 256
+assert DSPARK_QUERY_TOKENS_PADDED >= DSPARK_QUERY_TOKENS
+assert DSPARK_SWA_INDEX_WIDTH >= FLASH.sliding_window + DSPARK_QUERY_TOKENS
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
 PREFILL_SEQ = 512                 # S: prefill sequence for the current kernel programs
 PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
