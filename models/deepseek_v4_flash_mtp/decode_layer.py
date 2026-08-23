@@ -821,7 +821,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     for spec in moe_specs:
         if not isinstance(spec, TensorSpec):
             continue
-        if spec.name in {"x_hc", "x_next"}:
+        if spec.name in {"x_hc", "x_next", "moe_token_counts"}:
             continue
         if spec.name == "tid2eid":
             def init_tid2eid():

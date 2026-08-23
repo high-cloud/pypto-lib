@@ -848,7 +848,7 @@ def build_tensor_specs(layer_id=2):
 
     # MoE weight tensors (per rank). tid2eid keeps its hash-table init.
     for spec in build_moe_tensor_specs(layer_id=layer_id):
-        if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "x_next", "input_ids"}:
+        if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "x_next", "input_ids", "moe_token_counts"}:
             continue
         if spec.name == "tid2eid":
             def init_tid2eid(spec=spec):

@@ -1940,7 +1940,7 @@ def _build_moe_specs(layer_id: int):
     for spec in moe_specs:
         if not isinstance(spec, TensorSpec):
             continue  # drop ScalarSpecs (layer_id, num_tokens)
-        if spec.name in {"x_hc", "x_next", "input_ids"}:
+        if spec.name in {"x_hc", "x_next", "input_ids", "moe_token_counts"}:
             continue
         moe_keep.append(spec)
     return moe_keep
