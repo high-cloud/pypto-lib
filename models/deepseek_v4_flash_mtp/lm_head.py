@@ -21,6 +21,7 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import DECODE_TOKENS, FLASH as M, FP32_NEG_INF
+from sample import sample
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -402,6 +403,11 @@ def lm_head_with_sampling(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_modes: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -426,7 +432,15 @@ def lm_head_with_sampling(
         tp_rank,
         done_epoch,
     )
-    greedy_sample(logits, sampled_ids)
+    sample(
+        logits,
+        sampling_modes,
+        sampling_temperatures,
+        sampling_top_ks,
+        sampling_seeds,
+        sampling_positions,
+        sampled_ids,
+    )
     return logits, sampled_ids
 
 
@@ -435,6 +449,11 @@ def lm_head_with_sampling_test(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_modes: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -450,6 +469,11 @@ def lm_head_with_sampling_test(
         hidden_states,
         lm_head_weight,
         logit_row_indices,
+        sampling_modes,
+        sampling_temperatures,
+        sampling_top_ks,
+        sampling_seeds,
+        sampling_positions,
         logits,
         sampled_ids,
         hidden_window,
@@ -466,6 +490,11 @@ def lm_head_with_sampling_test(
 def l3_lm_head(
     hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    sampling_modes: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    sampling_temperatures: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    sampling_seeds: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[
         pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
@@ -485,7 +514,9 @@ def l3_lm_head(
         logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
         logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         lm_head_with_sampling_test(
-            hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            hidden_states[r], lm_head_weight[r], logit_row_indices[r],
+            sampling_modes[r], sampling_temperatures[r], sampling_top_ks[r], sampling_seeds[r],
+            sampling_positions[r], logits[r],
             sampled_ids[r],
             hidden_window, hidden_done, logits_window, logits_done,
             r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
@@ -552,6 +583,38 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             torch.bfloat16,
             init_value=init_lm_head_weight,
             resident="stacked",
+        ),
+        TensorSpec(
+            "sampling_modes",
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
+            torch.int32,
+            init_value=lambda: torch.zeros(WORLD_SIZE, MAX_LOGIT_ROWS, dtype=torch.int32),
+        ),
+        TensorSpec(
+            "sampling_temperatures",
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
+            torch.float32,
+            init_value=lambda: torch.zeros(WORLD_SIZE, MAX_LOGIT_ROWS, dtype=torch.float32),
+        ),
+        TensorSpec(
+            "sampling_seeds",
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
+            torch.int32,
+            init_value=lambda: torch.zeros(WORLD_SIZE, MAX_LOGIT_ROWS, dtype=torch.int32),
+        ),
+        TensorSpec(
+            "sampling_top_ks",
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
+            torch.int32,
+            init_value=lambda: torch.full(
+                (WORLD_SIZE, MAX_LOGIT_ROWS), VOCAB, dtype=torch.int32
+            ),
+        ),
+        TensorSpec(
+            "sampling_positions",
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
+            torch.int32,
+            init_value=lambda: torch.arange(MAX_LOGIT_ROWS, dtype=torch.int32).expand(WORLD_SIZE, -1).contiguous(),
         ),
         TensorSpec(
             "logits",
