@@ -69,6 +69,7 @@ from decode_fwd import (
     MAX_LOGIT_ROWS,
     MAX_SEQ_LEN,
     MIX_HC,
+    MOE_STATS_NUM_LAYERS,
     MOE_INTER,
     N_CACHE_GROUPS,
     N_EXPERTS_GLOBAL,
