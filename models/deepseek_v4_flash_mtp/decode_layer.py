@@ -94,7 +94,7 @@ from moe import (
     build_tensor_specs as build_moe_tensor_specs,
     clear_moe_signals,
     golden_moe,
-    moe,
+    moe_legacy,
 )
 
 assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS
@@ -259,7 +259,7 @@ def decode_layer(
             x_attn,
         )
 
-    moe(
+    moe_legacy(
         x_attn,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
