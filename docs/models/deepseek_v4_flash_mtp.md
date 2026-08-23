@@ -155,7 +155,13 @@ collectives (per-source lanes with folded notifies); `expert_shared` and
 `rms_norm` normalizes it, and `lm_head` all-gathers hidden rows across the DP
 owners, projects them against this card's vocab shard, then all-to-alls the
 logits so each owner ends with its own rows over the full vocabulary. Greedy
-sampling is fused into the same program.
+or temperature sampling is fused into the same program. Each logits row takes
+a temperature, seed, and position. Temperatures below `1e-5` select greedy
+sampling; other values use counter-based Gumbel-max over the full vocabulary.
+The fused `decode_fwd_mtp` entry shares temperature and seed tensors between
+the main and draft paths while taking positions from each path's
+device-resident metadata. Top-p filtering is not part of this kernel;
+temperature sampling currently uses the full vocabulary (`top_p = 1`).
 
 ### MTP path
 
@@ -185,6 +191,10 @@ follows the tuning of this decode path in order — contracts and golden first,
 then the general tiling / parallelism / fusion levers, the attention,
 hyper-connection, MoE and router rewrites, scheduling, and finally
 serving-level residency and lowering — with the limit measured at each step.
+
+The fused fixture defaults to greedy sampling. Use
+`--temperature <positive-value> --seed <value>` to exercise temperature
+sampling on both the main and MTP LM-head tails.
 
 ## Files
 
