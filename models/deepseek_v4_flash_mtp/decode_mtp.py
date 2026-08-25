@@ -140,7 +140,6 @@ def decode_mtp(
     mtp_norm_w: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    sampling_modes: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
     sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -213,7 +212,7 @@ def decode_mtp(
         rms_norm(x_head, mtp_norm_w, hidden_out)
         lm_head_with_sampling(
             hidden_out, lm_head_weight, logit_row_indices,
-            sampling_modes, sampling_temperatures, sampling_top_ks, sampling_seeds, position_ids,
+            sampling_temperatures, sampling_top_ks, sampling_seeds, position_ids,
             logits,
             sampled_ids,
             lm_head_hidden_window, lm_head_hidden_done,
@@ -283,7 +282,6 @@ def l2_decode_mtp(
     mtp_norm_w: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    sampling_modes: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
     sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -335,7 +333,7 @@ def l2_decode_mtp(
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
         mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, mtp_norm_w,
         lm_head_weight, logit_row_indices,
-        sampling_modes, sampling_temperatures, sampling_top_ks, sampling_seeds,
+        sampling_temperatures, sampling_top_ks, sampling_seeds,
         hidden_out, next_pre_hc_hidden, logits, sampled_ids,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
@@ -402,7 +400,6 @@ def l3_decode_mtp(
     mtp_hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     mtp_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
-    sampling_modes: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     sampling_temperatures: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.FP32],
     sampling_top_ks: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     sampling_seeds: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
@@ -462,7 +459,7 @@ def l3_decode_mtp(
             shared_w2[r], shared_w2_scale[r],
             mtp_hc_head_fn[r], mtp_hc_head_scale[r], mtp_hc_head_base[r], mtp_norm_w[r],
             lm_head_weight[r], logit_row_indices[r],
-            sampling_modes[r], sampling_temperatures[r], sampling_top_ks[r], sampling_seeds[r],
+            sampling_temperatures[r], sampling_top_ks[r], sampling_seeds[r],
             hidden_out[r], next_pre_hc_hidden[r], logits[r], sampled_ids[r],
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
@@ -796,12 +793,6 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         resident="stacked",
     )
     specs.append(lm_head_spec)
-    specs.append(TensorSpec(
-        "sampling_modes",
-        [N_RANKS, MAX_LOGIT_ROWS],
-        torch.int32,
-        init_value=lambda: torch.zeros(N_RANKS, MAX_LOGIT_ROWS, dtype=torch.int32),
-    ))
     specs.append(TensorSpec(
         "sampling_temperatures",
         [N_RANKS, MAX_LOGIT_ROWS],

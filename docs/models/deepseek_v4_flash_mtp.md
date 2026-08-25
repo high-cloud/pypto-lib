@@ -156,14 +156,14 @@ collectives (per-source lanes with folded notifies); `expert_shared` and
 owners, projects them against this card's vocab shard, then all-to-alls the
 logits so each owner ends with its own rows over the full vocabulary. Greedy
 or temperature/top-k sampling is fused into the same program. Each logits row
-takes a sampling mode, temperature, top-k, seed, and position. Mode 0 is
-greedy; mode 1 applies temperature, optionally keeps the largest 1 through 64
-logits, then uses counter-based Gumbel-max. A top-k value less than or equal to
-zero or at least the vocabulary size disables filtering. The fused
-`decode_fwd_mtp` entry shares mode, temperature, top-k, and seed tensors between
-the main and draft paths while taking positions from each path's
-device-resident metadata. Top-p filtering is not part of this kernel
-(`top_p = 1`).
+takes a temperature, top-k, seed, and position. A temperature below `1e-5`
+selects greedy decoding. Otherwise the kernel scales logits by temperature,
+optionally keeps the largest 1 through 64 logits, then uses counter-based
+Gumbel-max. A top-k value less than or equal to zero or at least the vocabulary
+size disables filtering. The fused `decode_fwd_mtp` entry shares temperature,
+top-k, and seed tensors between the main and draft paths while taking positions
+from each path's device-resident metadata. Top-p filtering is not part of this
+kernel (`top_p = 1`).
 
 ### MTP path
 
@@ -195,7 +195,7 @@ hyper-connection, MoE and router rewrites, scheduling, and finally
 serving-level residency and lowering — with the limit measured at each step.
 
 The fused fixture defaults to greedy sampling. Use
-`--sampling-mode gumbel --temperature <positive-value> --top-k <1-64> --seed <value>`
+`--temperature <positive-value> --top-k <1-64> --seed <value>`
 to exercise temperature/top-k sampling on both the main and MTP LM-head tails.
 
 ## Files

@@ -393,7 +393,6 @@ def l2_decode_fwd_mtp(
     final_norm_w: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    sampling_modes: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
     sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -559,7 +558,7 @@ def l2_decode_fwd_mtp(
         input_ids,
         hc_head_fn, hc_head_scale, hc_head_base, final_norm_w,
         lm_head_weight, logit_row_indices,
-        sampling_modes, sampling_temperatures, sampling_top_ks, sampling_seeds,
+        sampling_temperatures, sampling_top_ks, sampling_seeds,
         pre_hc_hidden_out, hidden_out, logits, sampled_ids,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
@@ -609,7 +608,7 @@ def l2_decode_fwd_mtp(
         mtp_shared_w1, mtp_shared_w1_scale, mtp_shared_w3, mtp_shared_w3_scale, mtp_shared_w2, mtp_shared_w2_scale,
         mtp_mtp_hc_head_fn, mtp_mtp_hc_head_scale, mtp_mtp_hc_head_base, mtp_mtp_norm_w,
         lm_head_weight, mtp_logit_row_indices,
-        sampling_modes, sampling_temperatures, sampling_top_ks, sampling_seeds,
+        sampling_temperatures, sampling_top_ks, sampling_seeds,
         mtp_hidden_out, mtp_next_pre_hc_hidden, mtp_logits, mtp_sampled_ids,
         mtp_recv_meta, mtp_recv_x, mtp_recv_aux, mtp_recv_route,
         mtp_arrived, mtp_data_arrived, mtp_routed_y_buf, mtp_combine_arrived,
@@ -722,7 +721,6 @@ def l3_decode_fwd_mtp(
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
-    sampling_modes: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     sampling_temperatures: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.FP32],
     sampling_top_ks: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     sampling_seeds: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
@@ -877,7 +875,7 @@ def l3_decode_fwd_mtp(
             input_ids[rank],
             hc_head_fn[rank], hc_head_scale[rank], hc_head_base[rank], final_norm_w[rank],
             lm_head_weight[rank], logit_row_indices[rank],
-            sampling_modes[rank], sampling_temperatures[rank], sampling_top_ks[rank], sampling_seeds[rank],
+            sampling_temperatures[rank], sampling_top_ks[rank], sampling_seeds[rank],
             pre_hc_hidden_out[rank], hidden_out[rank], logits[rank], sampled_ids[rank],
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
@@ -923,8 +921,7 @@ def build_tensor_specs(
     hca_state_block_num=HCA_COMPRESS_STATE_BLOCK_NUM,
     csa_state_block_num=CSA_MAIN_STATE_BLOCK_NUM,
     inner_state_block_num=CSA_INNER_STATE_BLOCK_NUM,
-    sampling_mode="greedy",
-    sampling_temperature=1.0,
+    sampling_temperature=0.0,
     sampling_top_k=LM_HEAD_VOCAB,
     sampling_seed=0,
 ):
@@ -953,18 +950,10 @@ def build_tensor_specs(
         )
     }
 
-    sampling_mode_value = 0 if sampling_mode == "greedy" else 1
-    sampling_temperature_value = 0.0 if sampling_mode == "greedy" else sampling_temperature
-    forward_specs["sampling_modes"] = replace(
-        forward_specs["sampling_modes"],
-        init_value=lambda: torch.full(
-            (N_RANKS, MAX_LOGIT_ROWS), sampling_mode_value, dtype=torch.int32
-        ),
-    )
     forward_specs["sampling_temperatures"] = replace(
         forward_specs["sampling_temperatures"],
         init_value=lambda: torch.full(
-            (N_RANKS, MAX_LOGIT_ROWS), sampling_temperature_value, dtype=torch.float32
+            (N_RANKS, MAX_LOGIT_ROWS), sampling_temperature, dtype=torch.float32
         ),
     )
     forward_specs["sampling_top_ks"] = replace(
@@ -1116,7 +1105,6 @@ def build_tensor_specs(
         "freqs_cos",
         "freqs_sin",
         "lm_head_weight",
-        "sampling_modes",
         "sampling_temperatures",
         "sampling_top_ks",
         "sampling_seeds",
@@ -1188,8 +1176,7 @@ def main():
     parser.add_argument("--hca-state-block-num", type=int, default=HCA_COMPRESS_STATE_BLOCK_NUM)
     parser.add_argument("--csa-state-block-num", type=int, default=CSA_MAIN_STATE_BLOCK_NUM)
     parser.add_argument("--inner-state-block-num", type=int, default=CSA_INNER_STATE_BLOCK_NUM)
-    parser.add_argument("--sampling-mode", choices=("greedy", "gumbel"), default="greedy")
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=LM_HEAD_VOCAB)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -1215,9 +1202,7 @@ def main():
     )
     assert N_RANKS == args.ep, f"import-time N_RANKS must match --ep, got {N_RANKS} vs {args.ep}"
     assert args.start_pos >= 1, f"--start-pos must be at least 1, got {args.start_pos}"
-    assert args.sampling_mode == "greedy" or args.temperature > 0.0, (
-        f"Gumbel sampling requires --temperature > 0, got {args.temperature}"
-    )
+    assert args.temperature >= 0.0, f"--temperature must be non-negative, got {args.temperature}"
     assert args.top_k <= 0 or args.top_k <= SAMPLING_TOPK_MAX or args.top_k >= LM_HEAD_VOCAB, (
         f"--top-k must be <= {SAMPLING_TOPK_MAX} or unrestricted, got {args.top_k}"
     )
@@ -1236,7 +1221,6 @@ def main():
             hca_state_block_num=args.hca_state_block_num,
             csa_state_block_num=args.csa_state_block_num,
             inner_state_block_num=args.inner_state_block_num,
-            sampling_mode=args.sampling_mode,
             sampling_temperature=args.temperature,
             sampling_top_k=args.top_k,
             sampling_seed=args.seed,
