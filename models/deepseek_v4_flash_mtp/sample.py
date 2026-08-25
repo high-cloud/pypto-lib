@@ -85,34 +85,12 @@ def _counter_gumbel(
 
 
 @pl.jit.inline
-def _token_gumbel(
-    token_ids: pl.Tensor[[1, TOPK_MAX], pl.INT32],
-    random_key: pl.Scalar[pl.INT32],
+def apply_temperature(
+    logits: pl.Tensor[[SAMPLE_BLOCK_ROWS_TILE, SAMPLE_ROW_WIDTH_TILE], pl.FP32],
+    temperature: pl.Scalar[pl.FP32],
 ):
-    """Generate Gumbel noise whose counter is each selected token ID."""
-    key_zeros = pl.mul(token_ids, pl.cast(0, pl.INT32))
-    random_key_tile = pl.add(key_zeros, random_key)
-    positive_mask = pl.full([1, TOPK_MAX], dtype=pl.INT32, value=0x7FFFFFFF)
-    random_bits = pl.xor(token_ids, random_key_tile)
-    shifted = pl.shrs(random_bits, 16)
-    random_bits = pl.xor(random_bits, shifted)
-    random_bits = pl.mul(random_bits, pl.cast(HASH_MULTIPLIER, pl.INT32))
-    random_bits = pl.and_(random_bits, positive_mask)
-    shifted = pl.shrs(random_bits, 16)
-    random_bits = pl.xor(random_bits, shifted)
-    random_bits = pl.mul(random_bits, pl.cast(HASH_MULTIPLIER, pl.INT32))
-    random_bits = pl.and_(random_bits, positive_mask)
-    shifted = pl.shrs(random_bits, 16)
-    random_bits = pl.xor(random_bits, shifted)
-
-    uniform_bits = pl.shrs(random_bits, 8)
-    uniform_fp32 = pl.cast(uniform_bits, pl.FP32)
-    uniform_centered = pl.add(uniform_fp32, 0.5)
-    uniform = pl.mul(uniform_centered, UINT23_SCALE)
-    log_uniform = pl.log(uniform)
-    negative_log_uniform = pl.neg(log_uniform)
-    log_negative_log_uniform = pl.log(negative_log_uniform)
-    return pl.neg(log_negative_log_uniform)
+    """Scale logits by temperature."""
+    return pl.div(logits, temperature)
 
 
 @pl.jit.inline
@@ -125,7 +103,9 @@ def _topk_group_pairs(
     """Return the largest TOPK_MAX scaled logits from one full group."""
     group_start = group * TOPK_GROUP_WIDTH
     scores = pl.slice(logits, [1, TOPK_GROUP_WIDTH], [row, group_start])
-    scaled_scores = pl.div(scores, temperature)
+    scores_tile = pl.reshape(scores, [SAMPLE_BLOCK_ROWS_TILE, SAMPLE_ROW_WIDTH_TILE])
+    scaled_scores_tile = apply_temperature(scores_tile, temperature)
+    scaled_scores = pl.reshape(scaled_scores_tile, [1, TOPK_GROUP_WIDTH])
     indices = pl.arange(pl.cast(group_start, pl.UINT32), [1, TOPK_GROUP_WIDTH], dtype=pl.UINT32)
     pairs = pl.sort32(scaled_scores, indices)
     pairs = pl.mrgsort(pairs, block_len=64)
@@ -135,14 +115,52 @@ def _topk_group_pairs(
 
 
 @pl.jit.inline
-def _sample_topk(
+def gumbel_sample(
+    candidate_values: pl.Tensor[[1, TOPK_MAX], pl.FP32],
+    candidate_ids: pl.Tensor[[1, TOPK_MAX], pl.INT32],
+    random_key: pl.Scalar[pl.INT32],
+):
+    """Sample one token from filtered candidates with Gumbel-max."""
+    key_zeros = pl.mul(candidate_ids, pl.cast(0, pl.INT32))
+    random_key_tile = pl.add(key_zeros, random_key)
+    positive_mask = pl.full([1, TOPK_MAX], dtype=pl.INT32, value=0x7FFFFFFF)
+    random_bits = pl.xor(candidate_ids, random_key_tile)
+    shifted = pl.shrs(random_bits, 16)
+    random_bits = pl.xor(random_bits, shifted)
+    random_bits = pl.mul(random_bits, pl.cast(HASH_MULTIPLIER, pl.INT32))
+    random_bits = pl.and_(random_bits, positive_mask)
+    shifted = pl.shrs(random_bits, 16)
+    random_bits = pl.xor(random_bits, shifted)
+    random_bits = pl.mul(random_bits, pl.cast(HASH_MULTIPLIER, pl.INT32))
+    random_bits = pl.and_(random_bits, positive_mask)
+    shifted = pl.shrs(random_bits, 16)
+    random_bits = pl.xor(random_bits, shifted)
+    uniform_bits = pl.shrs(random_bits, 8)
+    uniform_fp32 = pl.cast(uniform_bits, pl.FP32)
+    uniform_centered = pl.add(uniform_fp32, 0.5)
+    uniform = pl.mul(uniform_centered, UINT23_SCALE)
+    log_uniform = pl.log(uniform)
+    negative_log_uniform = pl.neg(log_uniform)
+    log_negative_log_uniform = pl.log(negative_log_uniform)
+    gumbel_noise = pl.neg(log_negative_log_uniform)
+    sampled_scores = pl.add(candidate_values, gumbel_noise)
+    sampled_scores_pad = pl.create_tensor([SAMPLE_BLOCK_ROWS_TILE, TOPK_MAX], dtype=pl.FP32)
+    for lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
+        sampled_scores_pad[lane : lane + 1, :] = sampled_scores
+    winner = pl.read(pl.row_argmax(sampled_scores_pad), [0, 0])
+    return pl.read(candidate_ids, [0, pl.cast(winner, pl.INDEX)])
+
+
+@pl.jit.inline
+def apply_top_k(
     logits: pl.Tensor,
     row: pl.Scalar[pl.INDEX],
     top_k: pl.Scalar[pl.INT32],
     temperature: pl.Scalar[pl.FP32],
-    random_key: pl.Scalar[pl.INT32],
+    filtered_values: pl.Tensor[[1, TOPK_MAX], pl.FP32],
+    topk_ids: pl.Tensor[[1, TOPK_MAX], pl.INT32],
 ):
-    """Apply temperature, select exact global top-k, then sample by Gumbel-max."""
+    """Write the exact top-k candidates from one scaled logits row."""
     candidate_values = pl.create_tensor([1, TOPK_CANDIDATE_PAD], dtype=pl.FP32)
     candidate_values_fill = pl.full([1, TOPK_CANDIDATE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
     candidate_values[:, :] = candidate_values_fill
@@ -160,7 +178,10 @@ def _sample_topk(
 
     tail_start = TOPK_NUM_FULL_GROUPS * TOPK_GROUP_WIDTH
     tail_scores_raw = pl.slice(logits, [1, TOPK_GROUP_TAIL], [row, tail_start])
-    tail_scores = pl.div(tail_scores_raw, temperature)
+    tail_scores_pad = pl.full([SAMPLE_BLOCK_ROWS_TILE, SAMPLE_ROW_WIDTH_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+    tail_scores_pad[0:1, 0:TOPK_GROUP_TAIL] = tail_scores_raw
+    tail_scaled_scores_pad = apply_temperature(tail_scores_pad, temperature)
+    tail_scores = tail_scaled_scores_pad[0:1, 0:TOPK_GROUP_TAIL]
     tail_indices = pl.arange(pl.cast(tail_start, pl.UINT32), [1, TOPK_GROUP_TAIL], dtype=pl.UINT32)
     tail_pairs = pl.sort32(tail_scores, tail_indices)
     tail_pairs = pl.mrgsort(tail_pairs, block_len=64)
@@ -184,24 +205,14 @@ def _sample_topk(
     topk_pairs = pl.mrgsort(half0_pairs, half1_pairs)[:, 0 : 2 * TOPK_MAX]
     topk_values = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
     selected_positions = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-    topk_ids = pl.create_tensor([1, TOPK_MAX], dtype=pl.INT32)
     for k in pl.range(TOPK_MAX):
         candidate_position = pl.read(selected_positions, [0, k])
         token_id = pl.read(candidate_ids, [0, pl.cast(candidate_position, pl.INDEX)])
         pl.write(topk_ids, [0, k], token_id)
 
-    gumbel_noise = _token_gumbel(topk_ids, random_key)
-    all_scores = pl.add(topk_values, gumbel_noise)
-    sampled_scores = pl.create_tensor([1, TOPK_MAX], dtype=pl.FP32)
-    sampled_scores[:, :] = pl.full([1, TOPK_MAX], dtype=pl.FP32, value=FP32_NEG_INF)
     for k in pl.range(TOPK_MAX):
         if k < top_k:
-            pl.write(sampled_scores, [0, k], pl.read(all_scores, [0, k]))
-    sampled_scores_pad = pl.create_tensor([SAMPLE_BLOCK_ROWS_TILE, TOPK_MAX], dtype=pl.FP32)
-    for lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
-        sampled_scores_pad[lane : lane + 1, :] = sampled_scores
-    winner = pl.read(pl.row_argmax(sampled_scores_pad), [0, 0])
-    return pl.read(topk_ids, [0, pl.cast(winner, pl.INDEX)])
+            pl.write(filtered_values, [0, k], pl.read(topk_values, [0, k]))
 
 
 @pl.jit.inline
@@ -220,7 +231,7 @@ def _sample_unrestricted(
         scores_flat = pl.slice(logits, [1, SAMPLE_BLOCK_ROWS_TILE * SAMPLE_ROW_WIDTH_TILE], [row, token_start])
         scores = pl.reshape(scores_flat, [SAMPLE_BLOCK_ROWS_TILE, SAMPLE_ROW_WIDTH_TILE])
         if random_flag > 0:
-            scaled_scores = pl.div(scores, temperature)
+            scaled_scores = apply_temperature(scores, temperature)
             gumbel_noise = _counter_gumbel(block, random_key)
             scores = pl.add(scaled_scores, gumbel_noise)
         local_winners = pl.row_argmax(scores)
@@ -240,9 +251,7 @@ def _sample_unrestricted(
     tail_scores_pad[0:SAMPLE_TAIL_ROWS, 0:SAMPLE_ROW_WIDTH_TILE] = tail_scores
     tail_block_scores = pl.mul(tail_scores_pad, 1.0)
     if random_flag > 0:
-        tail_scaled_scores = pl.div(tail_scores, temperature)
-        tail_scaled_scores_pad = pl.full([SAMPLE_BLOCK_ROWS_TILE, SAMPLE_ROW_WIDTH_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
-        tail_scaled_scores_pad[0:SAMPLE_TAIL_ROWS, 0:SAMPLE_ROW_WIDTH_TILE] = tail_scaled_scores
+        tail_scaled_scores_pad = apply_temperature(tail_scores_pad, temperature)
         tail_gumbel_noise = _counter_gumbel(SAMPLE_FULL_BLOCKS, random_key)
         tail_block_scores = pl.add(tail_scaled_scores_pad, tail_gumbel_noise)
     for lane in pl.range(SAMPLE_TAIL_ROWS, SAMPLE_BLOCK_ROWS_TILE):
@@ -290,7 +299,12 @@ def sample(
         random_key = pl.cast(random_key_index % RANDOM_KEY_MODULUS, pl.INT32)
         if random_flag > 0:
             if top_k > 0 and top_k <= TOPK_MAX:
-                best_index = _sample_topk(logits, row, top_k, temperature, random_key)
+                candidate_values = pl.create_tensor([1, TOPK_MAX], dtype=pl.FP32)
+                candidate_values[:, :] = pl.full([1, TOPK_MAX], dtype=pl.FP32, value=FP32_NEG_INF)
+                candidate_ids = pl.create_tensor([1, TOPK_MAX], dtype=pl.INT32)
+                candidate_ids[:, :] = pl.full([1, TOPK_MAX], dtype=pl.INT32, value=0)
+                apply_top_k(logits, row, top_k, temperature, candidate_values, candidate_ids)
+                best_index = gumbel_sample(candidate_values, candidate_ids, random_key)
             else:
                 best_index = _sample_unrestricted(logits, row, temperature, random_flag, random_key)
         else:
