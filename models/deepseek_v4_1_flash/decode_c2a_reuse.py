@@ -302,6 +302,7 @@ def golden_decode_c2a_reuse(
     compressed_cache_scale: "torch.Tensor",
     compressed_indices: "torch.Tensor",
 ) -> "AttentionGoldenResult":
+    """Evaluate C2A decode reuse against published compressed cache rows."""
     from models.deepseek_v4_1_flash.attention_common import golden_compressed_attention
     from models.deepseek_v4_1_flash.config import AttentionMode
 
@@ -333,8 +334,8 @@ def golden_decode_c2a_reuse(
         compressor_wkv=None,
         compressor_wgate=None,
         compressor_norm_weight=None,
-        compressor_state_rows=None,
-        compressor_state=None,
+        state_block_table=None,
+        state_cache=None,
         compressed_slots=None,
         position_ids=None,
         compressed_lens=None,

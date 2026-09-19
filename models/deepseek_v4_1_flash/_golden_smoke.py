@@ -29,6 +29,7 @@ def _mxfp8_weight(input_dim: int, output_dim: int) -> tuple[torch.Tensor, torch.
 
 
 def _attention_values() -> dict[str, torch.Tensor | None]:
+    """Build small deterministic inputs for all attention golden modes."""
     torch.manual_seed(7)
     wq_a, wq_a_scale = _mxfp8_weight(64, 64)
     wq_b, wq_b_scale = _mxfp8_weight(64, 128)
@@ -76,8 +77,10 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
         "candidate_mask": torch.ones(2, 2, dtype=torch.bool),
         "compressor_wkv": torch.randn(64, 64),
         "compressor_wgate": torch.randn(64, 64),
-        "compressor_state_rows": torch.tensor([0, 0]),
-        "compressor_state": torch.zeros(1, 2, 64),
+        "query_start_loc": torch.tensor([0, 2], dtype=torch.int32),
+        "token_to_req_indices": torch.tensor([0, 0], dtype=torch.int32),
+        "state_block_table": torch.tensor([[1]], dtype=torch.int32),
+        "state_cache": torch.zeros(2, 4, 128),
         "compressor_norm_weight": torch.ones(64, dtype=torch.bfloat16),
         "compressed_slots": torch.tensor([-1, 0]),
         "index_wk": torch.randn(64, 32, dtype=torch.bfloat16),

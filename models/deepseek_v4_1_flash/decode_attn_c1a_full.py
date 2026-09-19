@@ -1309,6 +1309,7 @@ def golden_decode_attn_c1a_reuse(
     compressed_cache_scale: torch.Tensor,
     compressed_indices: torch.Tensor,
 ) -> AttentionGoldenResult:
+    """Evaluate C1A decode reuse against the source layer caches."""
     return official_reference_c1a(
         mode=AttentionMode.REUSE,
         ratio=1,
@@ -1337,8 +1338,8 @@ def golden_decode_attn_c1a_reuse(
         compressor_wkv=None,
         compressor_wgate=None,
         compressor_norm_weight=None,
-        compressor_state_rows=None,
-        compressor_state=None,
+        state_block_table=None,
+        state_cache=None,
         compressed_slots=None,
         position_ids=None,
         compressed_lens=None,
@@ -1389,6 +1390,7 @@ def golden_decode_attn_c1a_reindex(
     index_wq_b_scale: torch.Tensor,
     index_weights_proj: torch.Tensor,
 ) -> AttentionGoldenResult:
+    """Evaluate C1A decode reindex with the source candidate mask."""
     return official_reference_c1a(
         mode=AttentionMode.REINDEX,
         ratio=1,
@@ -1417,8 +1419,8 @@ def golden_decode_attn_c1a_reindex(
         compressor_wkv=None,
         compressor_wgate=None,
         compressor_norm_weight=None,
-        compressor_state_rows=None,
-        compressor_state=None,
+        state_block_table=None,
+        state_cache=None,
         compressed_slots=None,
         position_ids=None,
         compressed_lens=compressed_lens,
@@ -1485,6 +1487,7 @@ def golden_decode_attn_c1a_full(
     index_wq_b_scale: torch.Tensor,
     index_weights_proj: torch.Tensor,
 ) -> AttentionGoldenResult:
+    """Evaluate C1A decode projection, cache publication and sparse attention."""
     return official_reference_c1a(
         mode=AttentionMode.FULL,
         ratio=1,
@@ -1513,8 +1516,8 @@ def golden_decode_attn_c1a_full(
         compressor_wkv=compressor_wkv,
         compressor_wgate=None,
         compressor_norm_weight=compressor_norm_weight,
-        compressor_state_rows=None,
-        compressor_state=None,
+        state_block_table=None,
+        state_cache=None,
         compressed_slots=compressed_slots,
         position_ids=None,
         compressed_lens=compressed_lens,

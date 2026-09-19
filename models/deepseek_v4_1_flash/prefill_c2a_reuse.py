@@ -23,7 +23,10 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.config import CMP_BLOCKS_DYN, D, HC_MULT, ORI_BLOCKS_DYN, T_DYN, TP_SIZE
+from models.deepseek_v4_1_flash.config import (
+    CMP_BLOCKS_DYN, D, HC_MULT, HEAD_DIM, LOCAL_H, LOCAL_O_WIDTH,
+    ORI_BLOCKS_DYN, Q_LORA, T_DYN, TP_SIZE,
+)
 from models.deepseek_v4_1_flash.decode_c2a_full import CMP_PACKED, CMP_SCALES
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 from models.deepseek_v4_1_flash.prefill_c2a_full import attention_hc_pre, run_prefill_c2a
@@ -198,11 +201,16 @@ def make_hc_program(capacity, world_size, epochs):
         for rank in pl.range(pld.world_size()):
             data = pld.window(data_buffer, [capacity, D], dtype=pl.FP32)
             signal = pld.window(signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+            # Each rank consumes packed MX_B_NN scale rows.
+            wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
+            wq_b_scale_r: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
+            wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
+            wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
             c2a_reuse_rank(
                 x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
-                attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank],
-                wq_b_scale[rank], wkv[rank], wkv_scale[rank], kv_norm_weight[rank],
-                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank], rope_cos[rank],
+                attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
+                wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank],
+                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank],
                 rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
                 window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
                 compressed_indices[rank], attn_input[rank], attn_output[rank], next_pre_mix[rank],
