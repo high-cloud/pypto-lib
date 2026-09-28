@@ -862,7 +862,7 @@ def official_reference_c1a(**args):
     wp = (grouped / ws.unsqueeze(-1)).flatten(-2).to(torch.float8_e4m3fn)
     valid = a["window_slots"] >= 0
     slots = a["window_slots"][valid].long()
-    window.flatten(0, 1)[slots, 0] = wp[valid]
+    window.view(torch.uint8).flatten(0, 1)[slots, 0] = wp.view(torch.uint8)[valid]
     window_scale.flatten(0, 1)[slots, 0] = encode_e8m0(ws)[valid]
     compressed = a["compressed_cache"].view(torch.uint8).clone()
     compressed_scale = a["compressed_cache_scale"].clone()
@@ -879,7 +879,7 @@ def official_reference_c1a(**args):
         valid = a["compressed_slots"] >= 0
         slots = a["compressed_slots"][valid].long()
         compressed.flatten(0, 1)[slots, 0] = cp[valid]
-        compressed_scale.flatten(0, 1)[slots, 0] = cs[valid]
+        compressed_scale.view(torch.uint8).flatten(0, 1)[slots, 0] = cs.view(torch.uint8)[valid]
         index.flatten(0, 1)[slots, 0] = kp[valid]
         index_scale.flatten(0, 1)[slots, 0] = ks[valid]
     candidates = a["candidate_mask"]

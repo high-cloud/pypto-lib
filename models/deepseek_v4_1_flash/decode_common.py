@@ -39,9 +39,10 @@ def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
     from publishing uninitialized data.
     """
     tokens = pl.tensor.dim(x, 0)
-    for row in pl.spmd(tokens, name_hint="decode_sp_zero_padding"):
-        if row >= valid_rows:
-            x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+    if tokens > 0:
+        for row in pl.spmd(tokens, name_hint="decode_sp_zero_padding"):
+            if row >= valid_rows:
+                x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
 
 BOUNDARY_PREFIX_NAMES = (

@@ -268,6 +268,7 @@ FLASH = DeepSeekV41Config(
 
 
 T_DYN = pl.dynamic("V41_T_DYN")
+LOCAL_T_DYN = pl.dynamic("V41_LOCAL_T_DYN")
 ROUTE_T_DYN = pl.dynamic("V41_ROUTE_T_DYN")
 B_DYN = pl.dynamic("V41_B_DYN")
 STATE_BLOCKS_DYN = pl.dynamic("V41_STATE_BLOCKS_DYN")
@@ -349,7 +350,15 @@ PREFILL_MAX_TOKENS = 4096
 DECODE_RECV_MAX = DP_SIZE * DECODE_MAX_TOKENS
 PREFILL_RECV_MAX = DP_SIZE * PREFILL_MAX_TOKENS
 RECV_MAX = PREFILL_RECV_MAX
-MOE_TOKENS = 16
+# Decode attention keeps a contiguous physical slab on every TP rank.  Pad the
+# largest supported slab to the 16-row MoE tile so every advertised TP mode can
+# hand its complete local extent to the FFN without truncation.
+MOE_ROW_TILE = 16
+LOCAL_DECODE_TOKENS = (DECODE_MAX_TOKENS + TP_SIZE - 1) // TP_SIZE
+MOE_TOKENS = (
+    (LOCAL_DECODE_TOKENS + MOE_ROW_TILE - 1) // MOE_ROW_TILE * MOE_ROW_TILE
+)
+MOE_RECV_MAX = EP_SIZE * MOE_TOKENS
 AUX_WIDTH = 8
 ROUTE_WIDTH = 8
 WINDOW_CACHE_GROUP = 32

@@ -28,11 +28,11 @@ from models.deepseek_v4_1_flash.golden import hc_post
 
 @pl.jit.inline
 def mhc_post(
-    sublayer: pl.Tensor[[T_DYN, D], pl.BF16],
-    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    sublayer: pl.Tensor,
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
 ):
     t_dim = pl.tensor.dim(sublayer, 0)
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])

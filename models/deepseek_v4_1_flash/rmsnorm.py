@@ -32,9 +32,9 @@ NORM_D_TILE = 512
 
 @pl.jit.inline
 def rms_norm(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    x: pl.Tensor,
     norm_w: pl.Tensor[[D], pl.BF16],
-    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+    x_normed: pl.Tensor,
 ):
     """Apply RMSNorm over all rows with FP32 accumulation and one BF16 cast."""
     t_dim = pl.tensor.dim(x, 0)

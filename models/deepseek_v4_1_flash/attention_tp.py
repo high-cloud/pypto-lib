@@ -12,11 +12,18 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from models.deepseek_v4_1_flash.config import D, DECODE_MAX_TOKENS, PREFILL_MAX_TOKENS, T_DYN, TP_SIZE
+from models.deepseek_v4_1_flash.config import (
+    D,
+    DECODE_MAX_TOKENS,
+    LOCAL_T_DYN,
+    PREFILL_MAX_TOKENS,
+    T_DYN,
+    TP_SIZE,
+)
 
 # Token extent of the sequence-parallel shard a rank keeps after the attention
 # output reduce-scatter; the plain all-reduce path keeps the full extent.
-OUTPUT_T_DYN = pl.dynamic("V41_TP_OUTPUT_T_DYN")
+OUTPUT_T_DYN = LOCAL_T_DYN
 
 
 def golden_tp_output_all_reduce(output_partials: torch.Tensor) -> torch.Tensor:
@@ -192,7 +199,7 @@ decode_tp_output_reduce_scatter = make_decode_tp_output_reduce(scatter=True)
 
 @pl.jit.inline(auto_scope=False)
 def decode_tp_input_all_gather(
-    local_input: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
+    local_input: pl.Tensor,
     input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     gathered: pl.Tensor[[T_DYN, D], pl.BF16],

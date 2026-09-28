@@ -32,9 +32,9 @@ T_TILE = 8
 
 @pl.jit.inline
 def mhc_pre(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    x_hc: pl.Tensor,
+    pre_mix: pl.Tensor,
+    output: pl.Tensor,
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])

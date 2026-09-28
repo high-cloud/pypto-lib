@@ -21,8 +21,6 @@ import torch
 from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.config import FLASH, HC_DIM, HC_MULT, MIX_HC
 
-C.RECV_MAX = C.EP_SIZE * C.MOE_TOKENS
-
 # The PyPTO specializer resolves static extents outside the function body, so the
 # kernel cannot read C.MOE_TOKENS directly.
 MOE_TOKENS = C.MOE_TOKENS
@@ -31,7 +29,7 @@ MX_GROUP = C.MX_GROUP
 MOE_INTER = C.MOE_INTER
 TOPK = C.TOPK
 N_LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
-RECV_MAX = C.RECV_MAX
+RECV_MAX = C.MOE_RECV_MAX
 EP_SIZE = C.EP_SIZE
 AUX_WIDTH = C.AUX_WIDTH
 ROUTE_WIDTH = C.ROUTE_WIDTH
@@ -47,7 +45,7 @@ from models.deepseek_v4_1_flash.expert_routed import (
     MX_W3_PACKED_ROWS,
     expert_routed,
 )
-from models.deepseek_v4_1_flash.ep_transport import dispatch, combine
+from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD, combine, dispatch
 from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
 from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
@@ -64,7 +62,7 @@ def _gen_routed_mx_weights_fixture(n_experts, dequant_std, seed_base=0):
 
 @pl.jit.inline(auto_scope=False)
 def _moe_core(
-    x_normed: pl.Tensor[[C.T_DYN, D], pl.BF16],
+    x_normed: pl.Tensor[[C.LOCAL_T_DYN, D], pl.BF16],
     gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[C.N_EXPERTS], pl.FP32],
     # Device ABI: checkpoint [expert,out,in] FP4 weights stay packed in HBM and
@@ -87,11 +85,15 @@ def _moe_core(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    output: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
+    combine_arrived: pld.DistributedTensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
+    output: pl.Out[pl.Tensor[[C.LOCAL_T_DYN, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -140,26 +142,34 @@ def _moe_core(
         recv_route_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
         recv_count_local = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
         recv_meta_local = pl.create_tensor([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        dispatch(indices, x_norm_mx, x_norm_scale, weights, recv_x_local, recv_scale_local_backing,
-                 recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
-                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived,
-                 data_arrived, num_tokens, ep_rank, moe_epoch)
+        input_ready = dispatch(
+            indices, x_norm_mx, x_norm_scale, weights,
+            recv_x_local, recv_scale_local_backing,
+            recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
+            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+            arrived, data_arrived, num_tokens, ep_rank, moe_epoch,
+        )
 
         routed_y = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.BF16)
         # dispatch already filled this backing; expert_routed views it as MX_A_ZZ.
-        expert_routed(recv_x_local, recv_scale_local_backing, recv_weight_local, recv_count_local,
-                      routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-                      routed_w2, routed_w2_scale, mxfp4_pair_lut, routed_y)
+        routed_y, expert_ready = expert_routed(
+            recv_x_local, recv_scale_local_backing,
+            recv_weight_local, recv_count_local,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale, mxfp4_pair_lut,
+            routed_y, input_ready,
+        )
         # combine writes the final output directly: a dynamically shaped intermediate
         # would escape its defining scope during PTOAS SSA conversion.
         combine(routed_y, recv_route_local, shared_output, output, recv_meta_local,
-                routed_output, combine_arrived, num_tokens, ep_rank, moe_epoch)
+                routed_output, combine_arrived, _output_zero_tid, expert_ready,
+                num_tokens, ep_rank, moe_epoch)
 
 
 @pl.jit.inline(auto_scope=False)
 def moe(
-    x_hc: pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[C.LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[C.LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -197,9 +207,9 @@ def moe(
     shared_w3_scale: pl.Tensor[
         [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
     ],
-    next_pre_mix: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[C.LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[C.LOCAL_T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[C.LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[
@@ -211,14 +221,18 @@ def moe(
     recv_routes: pld.DistributedTensor[
         [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32
     ],
-    arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]:
+) -> pl.Tensor[[C.LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
     """Run delayed mHC pre-mix, MoE, and residual expansion.
 
     The input pre_mix is produced by the preceding mHC sublayer. This
@@ -266,8 +280,8 @@ def moe(
 
 @pl.jit
 def moe_test(
-    x_hc: pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[C.LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[C.LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -305,9 +319,9 @@ def moe_test(
     shared_w3_scale: pl.Tensor[
         [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
     ],
-    next_pre_mix: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[C.LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[C.LOCAL_T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[C.LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[
@@ -319,19 +333,23 @@ def moe_test(
     recv_routes: pld.DistributedTensor[
         [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32
     ],
-    arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
     num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]:
-    x_hc.bind_dynamic(0, C.T_DYN)
-    pre_mix.bind_dynamic(0, C.T_DYN)
-    next_pre_mix.bind_dynamic(0, C.T_DYN)
-    x_mixed.bind_dynamic(0, C.T_DYN)
-    x_next.bind_dynamic(0, C.T_DYN)
+) -> pl.Tensor[[C.LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
+    x_hc.bind_dynamic(0, C.LOCAL_T_DYN)
+    pre_mix.bind_dynamic(0, C.LOCAL_T_DYN)
+    next_pre_mix.bind_dynamic(0, C.LOCAL_T_DYN)
+    x_mixed.bind_dynamic(0, C.LOCAL_T_DYN)
+    x_next.bind_dynamic(0, C.LOCAL_T_DYN)
     local_num_tokens = pl.read(num_tokens, [ep_rank])
     return moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -421,12 +439,18 @@ def l3_moe(
     recv_routes_buf = pld.alloc_window_buffer(
         [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32
     )
-    arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer(
+        [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32
+    )
+    data_arrived_buf = pld.alloc_window_buffer(
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
+    )
     routed_output_buf = pld.alloc_window_buffer(
         [MOE_TOKENS * TOPK, D], dtype=pl.BF16
     )
-    combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer(
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
+    )
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(
@@ -450,15 +474,21 @@ def l3_moe(
             [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH],
             dtype=pl.INT32,
         )
-        arrived = pld.window(arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        arrived = pld.window(
+            arrived_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32
+        )
         data_arrived = pld.window(
-            data_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32
+            data_arrived_buf,
+            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
+            dtype=pl.INT32,
         )
         routed_output = pld.window(
             routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16
         )
         combine_arrived = pld.window(
-            combine_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32
+            combine_arrived_buf,
+            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
+            dtype=pl.INT32,
         )
         # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
         routed_w1_scale_r: pl.Tensor[
@@ -928,16 +958,28 @@ def _local_mhc_compare(num_tokens):
     from golden.validation import ratio_reldiff
 
     counts = _normalise_num_tokens(num_tokens)
-    compare_active = ratio_reldiff(
-        diff_thd=3e-3,
-        pct_thd=0.02,
-        max_diff_hd=1.0,
-    )
-    compare_padding_row = ratio_reldiff(
-        diff_thd=3e-3,
-        pct_thd=0.02,
-        max_diff_hd=1.0,
-    )
+    base_compare = ratio_reldiff(diff_thd=3e-3, pct_thd=0.02)
+    max_abs_diff = 0.25
+
+    def compare_region(actual, expected, **kwargs):
+        ok, message = base_compare(actual, expected, **kwargs)
+        if not ok:
+            return False, message
+        actual_f = actual.float()
+        expected_f = expected.float()
+        abs_diff = (actual_f - expected_f).abs()
+        worst_flat = int(abs_diff.flatten().argmax().item())
+        worst_abs = float(abs_diff.flatten()[worst_flat].item())
+        if worst_abs > max_abs_diff:
+            actual_value = float(actual_f.flatten()[worst_flat].item())
+            expected_value = float(expected_f.flatten()[worst_flat].item())
+            return False, (
+                f"    worst absolute diff={worst_abs:.6g} at flat index "
+                f"{worst_flat}: actual={actual_value:.8g}, "
+                f"expected={expected_value:.8g}; exceeds "
+                f"max_abs_diff={max_abs_diff:.6g}"
+            )
+        return True, ""
 
     def compare(actual, expected, **kwargs):
         if actual.shape != expected.shape:
@@ -960,7 +1002,7 @@ def _local_mhc_compare(num_tokens):
                 )
         for rank, active in enumerate(counts.tolist()):
             if active:
-                ok, message = compare_active(
+                ok, message = compare_region(
                     actual[rank:rank + 1, :active],
                     expected[rank:rank + 1, :active],
                     **kwargs,
@@ -971,7 +1013,7 @@ def _local_mhc_compare(num_tokens):
                         f"MoE budget\n{message}"
                     )
             for row in range(active, MOE_TOKENS):
-                ok, message = compare_padding_row(
+                ok, message = compare_region(
                     actual[rank:rank + 1, row:row + 1],
                     expected[rank:rank + 1, row:row + 1],
                     **kwargs,

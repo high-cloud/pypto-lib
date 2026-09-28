@@ -70,11 +70,10 @@ def _string_list_assignment(name: str, variable: str) -> set[str]:
 
 @requires_pypto
 def test_decode_layer_schedule_covers_all_40_layers(composition):
-    resolve_decode_layer_plan = composition.resolve_decode_layer_plan
     DecodeLayerKind = composition.DecodeLayerKind
     REPRESENTATIVE_LAYER_IDS = composition.REPRESENTATIVE_LAYER_IDS
-    plans = [resolve_decode_layer_plan(layer_id) for layer_id in range(40)]
-    assert Counter(plan.kind for plan in plans) == {
+    kinds = [composition.decode_layer_kind(layer_id) for layer_id in range(40)]
+    assert Counter(kinds) == {
         DecodeLayerKind.SWA: 2,
         DecodeLayerKind.C2A_FULL: 3,
         DecodeLayerKind.C2A_REUSE: 15,
@@ -83,23 +82,27 @@ def test_decode_layer_schedule_covers_all_40_layers(composition):
         DecodeLayerKind.C1A_REUSE: 15,
     }
     assert {
-        kind: resolve_decode_layer_plan(layer_id).kind for kind, layer_id in REPRESENTATIVE_LAYER_IDS.items()
+        kind: composition.decode_layer_kind(layer_id) for kind, layer_id in REPRESENTATIVE_LAYER_IDS.items()
     } == {kind: kind for kind in DecodeLayerKind}
 
 
 @requires_pypto
 def test_decode_layer_schedule_resolves_cache_sources(composition):
-    resolve_decode_layer_plan = composition.resolve_decode_layer_plan
-    assert resolve_decode_layer_plan(2).kv_source_layer_id == 2
-    assert resolve_decode_layer_plan(7).index_source_layer_id == 2
-    assert resolve_decode_layer_plan(8).kv_source_layer_id == 8
-    assert resolve_decode_layer_plan(19).index_source_layer_id == 14
-    assert resolve_decode_layer_plan(20).is_candidate_source
-    assert resolve_decode_layer_plan(23).index_source_layer_id == 20
-    assert resolve_decode_layer_plan(24).index_source_layer_id == 24
-    assert resolve_decode_layer_plan(39).index_source_layer_id == 36
+    config = composition.C.FLASH.layer_config
+    assert config(2).kv_source_layer_id == 2
+    assert config(7).index_source_layer_id == 2
+    assert config(8).kv_source_layer_id == 8
+    assert config(19).index_source_layer_id == 14
+    assert config(20).is_candidate_source
+    assert config(23).index_source_layer_id == 20
+    assert config(24).index_source_layer_id == 24
+    assert config(39).index_source_layer_id == 36
     with pytest.raises(ValueError, match="layer_id must be"):
-        resolve_decode_layer_plan(40)
+        config(40)
+
+
+def test_decode_layer_has_no_duplicate_plan_module():
+    assert not (MODEL_DIR / "decode_layer_plan.py").exists()
 
 
 def test_decode_attention_modes_are_split_from_block_composition():
@@ -148,18 +151,33 @@ def test_decode_attention_modes_are_split_from_block_composition():
         assert [ast.unparse(arg) for arg in rank_call.args] == production_args
     block_calls = call_names(block)
     assert [
-        n for n in block_calls if n in ("golden_mhc_mixes", "golden_mhc_pre", "golden_moe", "golden_mhc_post")
+        n
+        for n in block_calls
+        if n in ("golden_mhc_mixes", "golden_mhc_pre", "golden_decode_moe", "golden_mhc_post")
     ] == [
         "golden_mhc_mixes",
         "golden_mhc_pre",
         "golden_mhc_post",
         "golden_mhc_mixes",
         "golden_mhc_pre",
-        "golden_moe",
+        "golden_decode_moe",
         "golden_mhc_post",
     ]
-    assert "load_decode_attention_module" in block_calls
-    assert not any(name.startswith("decode_c") or name == "decode_swa" for name in block_calls)
+    assert "load_decode_attention_module" not in block_calls
+    device = _function(layer_tree, "decode_layer")
+    assert {
+        node.func.id
+        for node in ast.walk(device)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    } >= {
+        "decode_swa_sharded",
+        "decode_c2a_full_sharded",
+        "decode_c2a_reuse_sharded",
+        "decode_c1a_full_sharded",
+        "decode_c1a_reindex_sharded",
+        "decode_c1a_reuse_sharded",
+        "moe",
+    }
     assert not (MODEL_DIR / "decode_attention.py").exists()
     for module_name in (
         "decode_swa",
@@ -199,9 +217,7 @@ def test_attention_pre_and_post_operators_have_single_public_owners():
         "grouped_output_with_deps",
         "o_proj",
         "prefill_o_proj",
-    } <= _string_list_assignment(
-        "o_proj.py", "__all__"
-    )
+    } <= _string_list_assignment("o_proj.py", "__all__")
 
     basic_factories = {"make_mx_projection", "make_norm", "make_rope", "make_bf16_projection"}
     for module_name in ("decode_attn_swa.py", "prefill_attn_swa.py", "prefill_c1a_common.py"):
@@ -214,9 +230,7 @@ def test_attention_pre_and_post_operators_have_single_public_owners():
     # C1A decode keeps only its distinct MX projection and uses shared TaskId-aware primitives.
     c1a_names = _top_level_functions("decode_attn_c1a_full.py")
     assert "make_mx_projection_with_deps" in c1a_names
-    assert c1a_names.isdisjoint(
-        {"grouped_output", "make_norm", "make_rope", "make_bf16_projection"}
-    )
+    assert c1a_names.isdisjoint({"grouped_output", "make_norm", "make_rope", "make_bf16_projection"})
     c1a_tree = _tree("decode_attn_c1a_full.py")
     referenced_names = {node.id for node in ast.walk(c1a_tree) if isinstance(node, ast.Name)}
     assert {
@@ -234,13 +248,62 @@ def test_attention_pre_and_post_operators_have_single_public_owners():
     assert {"qkv_proj_rope_with_deps", "o_proj_with_deps"} <= assigned_names
 
 
-@requires_pypto
-@pytest.mark.parametrize("layer_id", (0, 2, 3, 20, 24, 21))
-def test_decode_layer_unfinished_device_dependencies_are_explicit(layer_id, composition):
-    decode_layer_kernel_skip_reason = composition.decode_layer_kernel_skip_reason
-    reason = decode_layer_kernel_skip_reason(layer_id)
-    assert reason is not None and "EP8 MoE kernel" in reason
-    assert "attention kernel" not in reason
+def test_decode_layer_is_a_real_device_block():
+    tree = _tree("decode_layer.py")
+    function = _function(tree, "decode_layer")
+    decorators = {ast.unparse(node) for node in function.decorator_list}
+    assert "pl.jit" in decorators
+    assert "moe" in {
+        node.func.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+
+def test_decode_layer_persistent_attention_state_is_inout():
+    tree = _tree("decode_layer.py")
+    state_names = {
+        "window_cache",
+        "window_cache_scale",
+        "compressed_cache",
+        "compressed_cache_scale",
+        "index_cache",
+        "index_cache_scale",
+        "state_cache",
+        "topk_indices",
+        "candidate_mask",
+    }
+    for function_name in ("decode_layer", "l3_decode_layer"):
+        function = _function(tree, function_name)
+        annotations = {arg.arg: ast.unparse(arg.annotation) for arg in function.args.args}
+        assert all(annotations[name].startswith("pl.InOut[") for name in state_names)
+
+
+def test_decode_layer_validates_every_persistent_attention_state():
+    validate = _function(_tree("decode_layer.py"), "validate")
+    compare_fn = next(
+        keyword.value
+        for node in ast.walk(validate)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "compare_fn" and isinstance(keyword.value, ast.Dict)
+    )
+    compared = {
+        key.value
+        for key in compare_fn.keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    assert {
+        "window_cache",
+        "window_cache_scale",
+        "compressed_cache",
+        "compressed_cache_scale",
+        "index_cache",
+        "index_cache_scale",
+        "state_cache",
+        "topk_indices",
+        "candidate_mask",
+    } <= compared
 
 
 @requires_pypto
@@ -336,6 +399,23 @@ def test_decode_sequence_parallel_metadata_supports_empty_owner_slabs():
     ]
 
 
+def test_decode_padding_spmd_has_an_explicit_positive_guard():
+    function = _function(_tree("decode_common.py"), "zero_bf16_padding")
+    launch = next(node for node in ast.walk(function) if isinstance(node, ast.For))
+    guard = next(node for node in ast.walk(function) if isinstance(node, ast.If))
+    assert ast.unparse(guard.test) == "tokens > 0"
+    assert launch in guard.body
+    assert ast.unparse(launch.iter) == "pl.spmd(tokens, name_hint='decode_sp_zero_padding')"
+
+
+def test_decode_layer_avoids_boolean_and_in_orchestration_conditions():
+    function = _function(_tree("decode_layer.py"), "decode_layer")
+    assert not any(
+        isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And)
+        for node in ast.walk(function)
+    )
+
+
 def test_decode_sequence_parallel_metadata_covers_padded_and_short_batches():
     from models.deepseek_v4_1_flash.decode_sp_integration import validate_two_layer_metadata
 
@@ -347,6 +427,17 @@ def test_decode_sequence_parallel_metadata_covers_padded_and_short_batches():
     padded = validate_two_layer_metadata(num_tokens=5, tp_size=4, capacity=8)
     assert padded.hidden.shape == (5, 4)
     assert padded.hidden[-1].tolist() == [17.0, 18.0, 19.0, 20.0]
+
+
+@requires_pypto
+def test_decode_moe_token_owners_follow_contiguous_slabs(composition):
+    owners = composition._sequence_parallel_token_owners
+    assert owners(8, 4).tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
+    assert owners(5, 4).tolist() == [0, 0, 1, 1, 2]
+    assert owners(2, 4).tolist() == [0, 1]
+    assert owners(0, 4).numel() == 0
+    with pytest.raises(ValueError, match="tp_size must be positive"):
+        owners(8, 0)
 
 
 def test_decode_owner_slab_checks_cover_padding_on_every_layer():
@@ -365,19 +456,35 @@ def test_decode_owner_slab_checks_cover_padding_on_every_layer():
 
     # A layer updates the rows it owns only: the padding of the two-row slabs
     # survives untouched (rank 2 owns one row, rank 3 none).
-    second = transform_owner_rows(shards, num_tokens=num_tokens, transform=lambda rows: rows + 1, capacity=capacity)
-    check_owner_slabs(second, hidden + 1, num_tokens, capacity=capacity, name="residual rows", layer="the second layer")
+    second = transform_owner_rows(
+        shards, num_tokens=num_tokens, transform=lambda rows: rows + 1, capacity=capacity
+    )
+    check_owner_slabs(
+        second, hidden + 1, num_tokens, capacity=capacity, name="residual rows", layer="the second layer"
+    )
     counts = (2, 2, 1, 0)
-    assert [bool((shard.hidden[count:] == 0).all()) for shard, count in zip(second, counts)] == [True] * tp_size
-    check_owner_slabs(second, hidden + 1, num_tokens, capacity=capacity, name="residual rows", layer="the second layer")
+    assert [bool((shard.hidden[count:] == 0).all()) for shard, count in zip(second, counts)] == [
+        True
+    ] * tp_size
+    check_owner_slabs(
+        second, hidden + 1, num_tokens, capacity=capacity, name="residual rows", layer="the second layer"
+    )
 
     # A layer that rewrites its whole slab -- padding included -- is rejected on
     # that layer, before the gather would have dropped the stale rows silently.
     polluted = tuple(
-        DecodeTokenShard(shard.hidden + 1, shard.token_ids, shard.position_ids, shard.valid_mask) for shard in shards
+        DecodeTokenShard(shard.hidden + 1, shard.token_ids, shard.position_ids, shard.valid_mask)
+        for shard in shards
     )
     with pytest.raises(RuntimeError, match="non-zero residual rows padding"):
-        check_owner_slabs(polluted, hidden + 1, num_tokens, capacity=capacity, name="residual rows", layer="the second layer")
+        check_owner_slabs(
+            polluted,
+            hidden + 1,
+            num_tokens,
+            capacity=capacity,
+            name="residual rows",
+            layer="the second layer",
+        )
 
 
 def test_decode_swa_sharded_reduce_comparison_asserts_zero_padding():
@@ -387,7 +494,9 @@ def test_decode_swa_sharded_reduce_comparison_asserts_zero_padding():
     # The ReduceScatter publishes a fully materialized slab, so the sharded
     # comparison has to assert the inactive rows instead of ignoring them.
     assert '"attention_output"' in segment
-    assert "make_compare_sharded_rows(swa.compare_output)" in segment or "require_zero_padding=True" in segment
+    assert (
+        "make_compare_sharded_rows(swa.compare_output)" in segment or "require_zero_padding=True" in segment
+    )
 
 
 @requires_pypto
@@ -493,14 +602,7 @@ def test_decode_c1a_wiring_flag_selects_the_run_and_the_replay_tree():
 def test_decode_sequence_parallel_two_layer_chain(composition):
     from models.deepseek_v4_1_flash._golden_smoke import run_two_layer_decode_chain
 
-    try:
-        run_two_layer_decode_chain(composition.golden_decode_layer, tp_size=4)
-    except KeyError as error:
-        if "missing golden_moe input tensors" not in str(error):
-            raise
-        # The Block golden needs the upstream golden_moe ABI (#1308), which is
-        # still open.  This check starts running the moment that lands.
-        pytest.skip("upstream golden_moe ABI mismatch blocks the Block golden chain")
+    run_two_layer_decode_chain(composition.golden_decode_layer, tp_size=4)
 
 
 @requires_pypto
@@ -532,13 +634,9 @@ def test_decode_sequence_parallel_fixtures_differ_per_rank():
 
 @requires_pypto
 @pytest.mark.parametrize("layer_id", (0, 2, 3, 20, 24, 21))
-def test_attention_half_readiness_is_independent_of_moe(layer_id, composition):
-    attention_half_skip_reason = composition.attention_half_skip_reason
-    reason = attention_half_skip_reason(layer_id)
-    assert "MoE" not in (reason or "")
-    assert reason is None
-    mode = composition.load_decode_attention_module(composition.resolve_decode_layer_plan(layer_id).kind)
-    assert getattr(mode, "KERNEL_READY", True)
+def test_decode_layer_golden_selection_is_static(layer_id, composition):
+    golden = composition.ATTENTION_GOLDENS[composition.decode_layer_kind(layer_id)]
+    assert golden.__name__.startswith("golden_decode_attn_")
 
 
 @pytest.mark.parametrize(
@@ -646,9 +744,15 @@ def test_attention_leaf_public_entries_match_file_ownership(
 def test_attention_half_specs_match_host_and_do_not_generate_weights(
     layer_id, monkeypatch, composition, attention_common
 ):
+    from importlib import import_module
+
     C = attention_common.C
-    resolve_decode_layer_plan = composition.resolve_decode_layer_plan
-    mode = composition.load_decode_attention_module(resolve_decode_layer_plan(layer_id).kind)
+    module_name = {
+        composition.DecodeLayerKind.SWA: "decode_swa",
+        composition.DecodeLayerKind.C2A_FULL: "decode_c2a_full",
+        composition.DecodeLayerKind.C2A_REUSE: "decode_c2a_reuse",
+    }[composition.decode_layer_kind(layer_id)]
+    mode = import_module(f"models.deepseek_v4_1_flash.{module_name}")
     # Full's existing spec builder is eager; the SWA/Reuse builders stay lazy.
     if layer_id != 2:
 
@@ -679,8 +783,6 @@ def test_attention_half_specs_match_host_and_do_not_generate_weights(
             assert list(parameters[spec.name].annotation.shape) == spec.shape
     assert "compressed_indices" not in {spec.name for spec in specs}
     assert "x" not in {spec.name for spec in specs}
-    with pytest.raises(ValueError, match="host parameter names and order"):
-        composition.make_decode_layer_program(layer_id, C.TP_SIZE, 2, specs=specs[::-1])
 
 
 @requires_pypto
@@ -737,9 +839,315 @@ def test_block_golden_rejects_inactive_capacity(composition):
         composition.golden_decode_layer(**dict(inputs, num_tokens=1))
 
 
+def test_decode_layer_has_no_legacy_stage_dispatcher():
+    names = _top_level_functions("decode_layer.py")
+    assert "make_decode_layer_program" not in names
+    assert "decode_layer_kernel_skip_reason" not in names
+    assert "attention_half_skip_reason" not in names
+
+
+def test_decode_fwd_directly_composes_the_backbone():
+    tree = _tree("decode_fwd.py")
+    imported_names = {
+        alias.name for node in tree.body if isinstance(node, ast.ImportFrom) for alias in node.names
+    }
+    referenced_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert "decode_layer" not in imported_names
+    assert "decode_layer" not in referenced_names
+    assert {
+        "decode_swa_sharded",
+        "decode_c2a_full_sharded",
+        "decode_c2a_reuse_sharded",
+        "decode_c1a_full_sharded",
+        "decode_c1a_reindex_sharded",
+        "decode_c1a_reuse_sharded",
+        "moe",
+    } <= referenced_names
+    assert {"decode_fwd", "l2_decode_fwd"} <= referenced_names
+    assert "l3_decode_fwd" in _top_level_functions("decode_fwd.py")
+
+
 @requires_pypto
-def test_stage_selection_checks_only_required_dependencies(composition, attention_common):
-    with pytest.raises(NotImplementedError, match="MoE"):
-        composition.make_decode_layer_program(0, attention_common.C.EP_SIZE, 1, stage="block")
-    with pytest.raises(ValueError, match="unknown decode stage"):
-        composition.make_decode_layer_program(0, 1, 1, stage="ffn")
+def test_decode_moe_capacity_covers_the_largest_local_slab():
+    from models.deepseek_v4_1_flash import config, moe
+
+    local_slab = (config.DECODE_MAX_TOKENS + config.TP_SIZE - 1) // config.TP_SIZE
+    assert config.MOE_TOKENS >= local_slab
+    assert config.MOE_TOKENS % config.MOE_ROW_TILE == 0
+    assert config.MOE_RECV_MAX == config.EP_SIZE * config.MOE_TOKENS
+    assert int(moe._normalise_num_tokens(17).min()) == 17
+
+
+@requires_pypto
+def test_decode_moe_precision_guard_is_stable_near_zero():
+    from models.deepseek_v4_1_flash import config, moe
+
+    shape = (config.EP_SIZE, config.MOE_TOKENS, 1, 1)
+    expected = torch.zeros(shape, dtype=torch.float32)
+    actual = expected.clone()
+    expected[0, 0, 0, 0] = -0.01
+    actual[0, 0, 0, 0] = 0.03
+
+    compare = moe._local_mhc_compare(config.MOE_TOKENS)
+    compare_kwargs = {
+        "actual_outputs": {},
+        "expected_outputs": {},
+        "inputs": {},
+        "rtol": 0.0,
+        "atol": 0.0,
+    }
+    assert compare(actual, expected, **compare_kwargs)[0]
+
+    actual[0, 0, 0, 0] = 0.5
+    passed, detail = compare(actual, expected, **compare_kwargs)
+    assert not passed
+    assert "max_abs_diff=0.25" in detail
+
+
+def test_decode_moe_orders_output_zero_before_combine_reduce():
+    moe_core = _function(_tree("moe.py"), "_moe_core")
+    combine_call = next(
+        node
+        for node in ast.walk(moe_core)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "combine"
+    )
+    assert "_output_zero_tid" in {ast.unparse(arg) for arg in combine_call.args}
+
+    combine = _function(_tree("ep_transport.py"), "combine")
+    reduce_spmd = next(
+        node
+        for node in ast.walk(combine)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and ast.unparse(node.func) == "pl.spmd"
+        and any(
+            keyword.arg == "name_hint"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "combine_reduce"
+            for keyword in node.keywords
+        )
+    )
+    deps = next(keyword.value for keyword in reduce_spmd.keywords if keyword.arg == "deps")
+    assert "output_ready" in {ast.unparse(element) for element in deps.elts}
+
+
+def test_decode_moe_uses_isolated_epoch_slots_for_transport_signals():
+    source = (MODEL_DIR / "ep_transport.py").read_text()
+
+    assert "SIGNAL_PAD = 128" in source
+    assert "[N_RANKS, N_LOCAL, SIGNAL_PAD]" in source
+    assert "offsets=[my_rank, loc_e, 0]" in source
+    assert "offsets=[src, loc_e, 0]" in source
+    assert "offsets=[my_rank, e, 0]" in source
+    assert "offsets=[src, e, 0]" in source
+    assert "value=moe_epoch, op=pld.NotifyOp.Set" in source
+    assert "pld.NotifyOp.AtomicAdd" not in source
+    assert "moe_epoch * N_LOCAL" not in source
+
+
+def test_prefill_layer_uses_decode_moe_transport_signal_layout():
+    source = (MODEL_DIR / "prefill_layer.py").read_text()
+
+    assert "from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD" in source
+    assert "[EP_SIZE, SIGNAL_PAD]" in source
+    assert "[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD]" in source
+    assert "arrived_buffer, [EP_SIZE, SIGNAL_PAD]" in source
+    assert "data_arrived_buffer,\n                [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD]" in source
+    assert "combine_arrived_buffer,\n                [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD]" in source
+
+
+@pytest.mark.parametrize("module_name", ["decode_layer", "decode_fwd"])
+def test_decode_entry_uses_moe_transport_signal_layout(module_name):
+    source = (MODEL_DIR / f"{module_name}.py").read_text()
+
+    assert "from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD" in source
+    assert "[EP_SIZE, SIGNAL_PAD]" in source
+    assert "[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD]" in source
+    assert "arrived_buffer, [EP_SIZE, SIGNAL_PAD]" in source
+    assert "data_arrived_buffer,\n            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD]" in source
+    assert "combine_arrived_buffer,\n            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD]" in source
+
+
+def test_decode_moe_orders_dispatch_and_expert_completion_edges():
+    expert_source = (MODEL_DIR / "expert_routed.py").read_text()
+    assert expert_source.count("for tile in pl.range(TILES_PER_EXPERT):") == 2
+    assert expert_source.count(
+        "tile_completion_tids[tile] = pl.system.task_dummy(deps=[])"
+    ) == 2
+    assert "deps=[gate_mxfp4_aiv_tid, input_ready]" in expert_source
+    assert "deps=[up_mxfp4_aiv_tid, input_ready]" in expert_source
+    assert "tile_completion_tids[t] = gate_up_act_quant_tid" in expert_source
+    assert "deps=[w2_mxfp4_aiv_tid, hidden_completion_tids[local_e]]" in expert_source
+    assert "tile_completion_tids[tt] = route_weight_tid" in expert_source
+    assert "return recv_y, expert_ready" in expert_source
+
+    moe_source = (MODEL_DIR / "moe.py").read_text()
+    assert "input_ready = dispatch(" in moe_source
+    assert "routed_y, expert_ready = expert_routed(" in moe_source
+    assert "_output_zero_tid, expert_ready," in moe_source
+
+
+@requires_pypto
+def test_decode_fwd_exposes_a_full_compile_fixture():
+    from golden import ScalarSpec
+    from models.deepseek_v4_1_flash import decode_fwd
+
+    specs = decode_fwd.build_tensor_specs()
+    assert [spec.name for spec in specs] == list(decode_fwd.l3_decode_fwd.param_names)
+    by_name = {spec.name: spec for spec in specs}
+    assert by_name["x_hc"].shape[1] == decode_fwd.MOE_TOKENS
+    assert by_name["x_hc"].shape[1] > 16
+    assert by_name["window_cache_pool"].shape[1] == decode_fwd.N_LAYERS
+    assert by_name["compressed_cache_pool"].shape[1] == decode_fwd.KV_SOURCE_COUNT
+    assert by_name["index_cache_pool"].shape[1] == decode_fwd.INDEX_SOURCE_COUNT
+    assert by_name["state_cache_pool"].shape[1] == decode_fwd.C2A_SOURCE_COUNT
+    assert isinstance(by_name["attention_num_tokens"], ScalarSpec)
+    assert by_name["attention_num_tokens"].compile_runtime
+    source = (MODEL_DIR / "decode_fwd.py").read_text()
+    assert "# ci: a5" in source
+    assert "# ci: no-sim" in source
+
+
+@requires_pypto
+def test_decode_fwd_schedule_and_cache_source_ordinals():
+    from models.deepseek_v4_1_flash import decode_fwd
+
+    modes = [layer.mode.value for layer in decode_fwd.BACKBONE_SCHEDULE]
+    assert Counter(modes) == {
+        "swa": 2,
+        "full": 4,
+        "reuse": 30,
+        "reindex": 4,
+    }
+    assert decode_fwd.cache_source_ordinals(0) == (None, None, None)
+    assert decode_fwd.cache_source_ordinals(2) == (0, 0, 0)
+    assert decode_fwd.cache_source_ordinals(7) == (0, 0, 0)
+    assert decode_fwd.cache_source_ordinals(8) == (1, 1, 1)
+    assert decode_fwd.cache_source_ordinals(19) == (2, 2, 2)
+    assert decode_fwd.cache_source_ordinals(20) == (3, 3, None)
+    assert decode_fwd.cache_source_ordinals(24) == (3, 4, None)
+    assert decode_fwd.cache_source_ordinals(39) == (3, 7, None)
+
+
+def test_decode_fwd_reuses_one_set_of_tp_and_ep_windows():
+    tree = _tree("decode_fwd.py")
+    host = _function(tree, "l3_decode_fwd")
+    assert [ast.unparse(decorator) for decorator in host.decorator_list] == ["pl.jit.host"]
+    allocations = [
+        node
+        for node in ast.walk(host)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "alloc_window_buffer"
+    ]
+    assert len(allocations) == 13
+    assert (
+        sum(
+            isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Attribute)
+            and node.iter.func.attr == "range"
+            for node in ast.walk(host)
+        )
+        == 1
+    )
+
+
+def test_decode_fwd_uses_runtime_schedule_blocks():
+    tree = _tree("decode_fwd.py")
+    device = _function(tree, "_decode_fwd")
+    loops = [node for node in device.body if isinstance(node, ast.For)]
+    assert [(ast.unparse(loop.target), ast.unparse(loop.iter)) for loop in loops] == [
+        ("c2a_block", "pl.range(C2A_SOURCE_COUNT)"),
+        ("c1a_block", "pl.range(4)"),
+    ]
+    calls = Counter(
+        node.func.id
+        for node in ast.walk(device)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and (node.func.id.startswith("decode_") or node.func.id == "moe")
+    )
+    assert calls == {
+        "decode_swa_sharded": 2,
+        "decode_c2a_full_sharded": 1,
+        "decode_c2a_reuse_sharded": 5,
+        "decode_c1a_full_sharded": 1,
+        "decode_c1a_reindex_sharded": 1,
+        "decode_c1a_reuse_sharded": 6,
+        "moe": 16,
+    }
+
+
+def test_decode_fwd_passes_row_concatenated_mx_scale_banks():
+    tree = _tree("decode_fwd.py")
+    device = _function(tree, "_decode_fwd")
+    host = _function(tree, "l3_decode_fwd")
+    scale_names = {
+        "wq_a_scale",
+        "wq_b_scale",
+        "wkv_scale",
+        "wo_b_scale",
+        "index_wq_b_scale",
+        "routed_w1_scale",
+        "routed_w2_scale",
+        "routed_w3_scale",
+        "shared_w1_scale",
+        "shared_w2_scale",
+        "shared_w3_scale",
+    }
+    assert len(device.args.args) == 83
+    assert scale_names <= {argument.arg for argument in device.args.args}
+    assert not any(
+        argument.arg.startswith(tuple(f"{name}_l" for name in scale_names))
+        or argument.arg.startswith("index_wq_b_scale_s")
+        for argument in device.args.args
+    )
+    host_annotations = {argument.arg: ast.unparse(argument.annotation) for argument in host.args.args}
+    for name in scale_names:
+        annotation = host_annotations[name]
+        assert "pl.MX_B_NN" not in annotation
+        assert "EP_SIZE" in annotation
+        assert "N_LAYERS," not in annotation
+    mx_slices = [
+        node
+        for node in ast.walk(device)
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.annotation, ast.Subscript)
+        and "pl.MX_B_NN" in ast.unparse(node.annotation)
+    ]
+    assert mx_slices
+    index_scale_slices = [
+        node
+        for node in mx_slices
+        if isinstance(node.target, ast.Name) and "index_wq_b_scale_source" in node.target.id
+    ]
+    assert len(index_scale_slices) == 3
+    host_loop = next(node for node in host.body if isinstance(node, ast.For))
+    assert not any(
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id.endswith("_scale_rank")
+        for node in host_loop.body
+    )
+
+
+def test_decode_fwd_hc_scale_slices_use_three_values_per_layer():
+    device = _function(_tree("decode_fwd.py"), "_decode_fwd")
+    scale_slices = [
+        node
+        for node in ast.walk(device)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "slice"
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id in {"hc_attn_scale", "hc_ffn_scale"}
+    ]
+    assert len(scale_slices) == 32
+    for scale_slice in scale_slices:
+        assert ast.unparse(scale_slice.args[1]) == "[3]"
+        offset = scale_slice.args[2].elts[0]
+        assert isinstance(offset, ast.BinOp) and isinstance(offset.op, ast.Mult)
+        assert isinstance(offset.right, ast.Constant) and offset.right.value == 3

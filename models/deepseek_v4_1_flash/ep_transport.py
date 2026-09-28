@@ -8,9 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """V4.1 EP8 transport migrated from V4-Pro and Flash-MTP.
 
-Each function documents its migration source; the data layout follows V4-Pro and the
-signal layout is the [EP, 1] form required by issue #1205. The transport expects one
-unique local token shard per rank and does not perform Attention-TP owner filtering.
+Each function documents its migration source; the data and signal layouts follow
+V4-Pro. The transport expects one unique local token shard per rank and does not
+perform Attention-TP owner filtering.
 """
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -22,17 +22,18 @@ TOPK = C.TOPK
 N_RANKS = C.EP_SIZE
 N_LOCAL = C.N_LOCAL_EXPERTS
 N_ROUTES = T * TOPK
-RECV_MAX = C.RECV_MAX
+RECV_MAX = C.MOE_RECV_MAX
 MX_GROUP = C.MX_GROUP
 K_SCALE = D // MX_GROUP
 MAX_PER_SRC = T
 AUX_W = 0
 AUX_PAD = C.AUX_WIDTH
 IDX_PAD = C.ROUTE_WIDTH
-SIGNAL_PAD = 1
+SIGNAL_PAD = 128  # 512-byte isolation stride per independently published epoch slot
 SCALE_COPY_TILE = 256
 SCALE_PACK_TMP = ((64 + K_SCALE + 31) // 32) * 32
 RECV_TILE = 16
+SCALE_PACK_TILES = (RECV_MAX + RECV_TILE - 1) // RECV_TILE
 
 @pl.jit.inline
 def dispatch(
@@ -51,8 +52,8 @@ def dispatch(
     recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, K_SCALE], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -167,7 +168,7 @@ def dispatch(
             if dst != my_rank:
                 pld.system.notify(
                     target=arrived, peer=dst, offsets=[my_rank, 0],
-                    value=1, op=pld.NotifyOp.AtomicAdd,
+                    value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
         # Wait for every source's metadata publication.
@@ -242,8 +243,8 @@ def dispatch(
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
-                    target=data_arrived, peer=peer, offsets=[my_rank, 0],
-                    value=1, op=pld.NotifyOp.AtomicAdd,
+                    target=data_arrived, peer=peer, offsets=[my_rank, loc_e, 0],
+                    value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
     # Each wait block covers the matching producer slot from every remote rank.
@@ -254,8 +255,8 @@ def dispatch(
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
-                    signal=data_arrived, offsets=[src, 0],
-                    expected=moe_epoch * N_LOCAL, cmp=pld.WaitCmp.Ge,
+                    signal=data_arrived, offsets=[src, loc_e, 0],
+                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                 )
 
     # Gather lanes into the compact per-expert buffers: one SPMD block per local
@@ -285,28 +286,34 @@ def dispatch(
                 pl.write(recv_route_out, [e, out_col], pl.read(recv_routes, [in_row, 0]))
             b = b + n
 
-    for local_e in pl.parallel(N_LOCAL):
+    with pl.spmd(
+        N_LOCAL * SCALE_PACK_TILES,
+        name_hint="dispatch_scale_pack",
+        deps=[_gather_tid],
+    ) as _scale_pack_tid:
+        block_idx = pl.tile.get_block_idx()
+        local_e = block_idx // SCALE_PACK_TILES
+        tile_idx = block_idx % SCALE_PACK_TILES
         e_rows = pl.read(recv_count_out, [local_e, 0])
-        e_tiles = (e_rows + 15) // 16
-        for tile_idx in pl.parallel(e_tiles):
-            flat_t0 = local_e * RECV_MAX + tile_idx * 16
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_scale_pack", deps=[_gather_tid]):
-                scale_nd = pl.load(recv_scale_nd, [flat_t0, 0], [16, K_SCALE])
-                scale_raw = pl.reinterpret_view(scale_nd, pl.UINT8)
-                tmp = pl.create_tile([1, SCALE_PACK_TMP], dtype=pl.UINT8)
-                scale_zz_raw = pl.tmov_x2zz(
-                    scale_raw,
-                    tmp,
-                    group_axis=1,
-                    dst_rows=16,
-                    dst_cols=K_SCALE,
-                )
-                scale_zz = pl.reinterpret_view(scale_zz_raw, pl.FP8E8M0)
-                recv_scale_out = pl.store(
-                    pl.reshape(scale_zz, [1, 16 * K_SCALE]),
-                    [0, flat_t0 * K_SCALE],
-                    recv_scale_out,
-                )
+        if tile_idx * RECV_TILE < e_rows:
+            flat_t0 = local_e * RECV_MAX + tile_idx * RECV_TILE
+            scale_nd = pl.load(recv_scale_nd, [flat_t0, 0], [RECV_TILE, K_SCALE])
+            scale_raw = pl.reinterpret_view(scale_nd, pl.UINT8)
+            tmp = pl.create_tile([1, SCALE_PACK_TMP], dtype=pl.UINT8)
+            scale_zz_raw = pl.tmov_x2zz(
+                scale_raw,
+                tmp,
+                group_axis=1,
+                dst_rows=RECV_TILE,
+                dst_cols=K_SCALE,
+            )
+            scale_zz = pl.reinterpret_view(scale_zz_raw, pl.FP8E8M0)
+            recv_scale_out = pl.store(
+                pl.reshape(scale_zz, [1, RECV_TILE * K_SCALE]),
+                [0, flat_t0 * K_SCALE],
+                recv_scale_out,
+            )
+    return _scale_pack_tid
 
 
 @pl.jit.inline
@@ -317,7 +324,9 @@ def combine(
     ffn_out: pl.Tensor[[T, D], pl.BF16],
     recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     routed_output: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
+    output_ready: pl.Scalar[pl.TASK_ID],
+    expert_ready: pl.Scalar[pl.TASK_ID],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -325,7 +334,11 @@ def combine(
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL * RECV_MAX, D])
     # One SPMD block per local expert pushes compact rows back to their origin
     # rank. Each route maps to one write-disjoint destination row.
-    with pl.spmd(N_LOCAL, name_hint="combine") as _cscatter_tid:
+    with pl.spmd(
+        N_LOCAL,
+        name_hint="combine",
+        deps=[expert_ready],
+    ) as _cscatter_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
@@ -344,8 +357,8 @@ def combine(
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
-                    target=combine_arrived, peer=peer, offsets=[my_rank, 0],
-                    value=1, op=pld.NotifyOp.AtomicAdd,
+                    target=combine_arrived, peer=peer, offsets=[my_rank, e, 0],
+                    value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
     # Match each scatter producer with an independent wait block. The full-grid
@@ -355,15 +368,19 @@ def combine(
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
-                    signal=combine_arrived, offsets=[src, 0],
-                    expected=moe_epoch * N_LOCAL, cmp=pld.WaitCmp.Ge,
+                    signal=combine_arrived, offsets=[src, e, 0],
+                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                 )
 
     # ffn_out[t] = sh[t] + Sigma_k routed_output[t*TOPK+k]. The wait orders
     # remote payload publication; routed_output rides pl.no_dep, so this rank's
     # own puts are ordered by the _cscatter_tid -> _cwait_tid -> _reduce_tid chain.
     # Accumulate the shared-expert and TOP-K routed results for every local token.
-    with pl.spmd(T, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
+    with pl.spmd(
+        T,
+        name_hint="combine_reduce",
+        deps=[_cwait_tid, output_ready],
+    ) as _reduce_tid:
         t = pl.tile.get_block_idx()
         if t < num_tokens:
             acc = pl.cast(pl.load(shared_output, [t, 0], [1, D]), target_type=pl.FP32)
@@ -403,8 +420,8 @@ def dispatch_test(
     recv_routes: pld.DistributedTensor[
         [N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32
     ],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     num_tokens: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -464,8 +481,10 @@ def l3_dispatch(
     recv_routes_buf = pld.alloc_window_buffer(
         [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
     )
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer(
+        [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32
+    )
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(
@@ -487,9 +506,13 @@ def l3_dispatch(
             [N_LOCAL * RECV_MAX, IDX_PAD],
             dtype=pl.INT32,
         )
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        arrived = pld.window(
+            arrived_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32
+        )
         data_arrived = pld.window(
-            data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            data_arrived_buf,
+            [N_RANKS, N_LOCAL, SIGNAL_PAD],
+            dtype=pl.INT32,
         )
         dispatch_test(
             indices[r], x_norm_mx[r], x_norm_scale[r], weights[r],
@@ -509,15 +532,21 @@ def combine_test(
     recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     ffn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     routed_output: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     num_tokens: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     local_num_tokens = pl.read(num_tokens, [my_rank])
+    with pl.spmd(T, name_hint="combine_output_zero") as output_ready:
+        t = pl.tile.get_block_idx()
+        zero_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+        ffn_out = pl.store(zero_row, [t, 0], ffn_out)
+    expert_ready = pl.system.task_dummy(deps=[])
     combine(
         recv_y, recv_route_out, shared_output, ffn_out, recv_meta_local,
         routed_output, combine_arrived,
+        output_ready, expert_ready,
         local_num_tokens, my_rank, moe_epoch,
     )
     return ffn_out
@@ -534,13 +563,17 @@ def l3_combine(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     routed_output_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer(
+        [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32
+    )
     for r in pl.range(pld.world_size()):
         routed_output = pld.window(
             routed_output_buf, [N_ROUTES, D], dtype=pl.BF16
         )
         combine_arrived = pld.window(
-            combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            combine_arrived_buf,
+            [N_RANKS, N_LOCAL, SIGNAL_PAD],
+            dtype=pl.INT32,
         )
         combine_test(
             recv_y[r], recv_route_out[r], shared_output[r],

@@ -38,15 +38,10 @@ from models.deepseek_v4_1_flash.config import (
 from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
 from models.deepseek_v4_1_flash.decode_attn_c2a_reuse import decode_attn_c2a_reuse, decode_attn_c2a_reuse_sharded
 from models.deepseek_v4_1_flash.decode_common import attention_pre, slab_owner
-from models.deepseek_v4_1_flash.decode_layer_plan import (
-    DecodeLayerKind,
-    REPRESENTATIVE_LAYER_IDS,
-    resolve_decode_layer_plan,
-)
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 
-KIND = DecodeLayerKind.C2A_REUSE
-REPRESENTATIVE_LAYER_ID = REPRESENTATIVE_LAYER_IDS[KIND]
+KIND = "C2A_REUSE"
+REPRESENTATIVE_LAYER_ID = 3
 ATTENTION_GOLDEN = reuse.golden_decode_attn_c2a_reuse
 KERNEL_READY = True
 LEAF_NAMES = tuple(
@@ -70,9 +65,9 @@ SHARDED_ATTENTION_SPEC_NAMES = (
 
 
 def skip_reason(layer_id=REPRESENTATIVE_LAYER_ID):
-    kind = resolve_decode_layer_plan(layer_id).kind
-    if kind != KIND:
-        return f"layer {layer_id} resolves to {kind.name}, expected {KIND.name}"
+    layer = C.FLASH.layer_config(layer_id)
+    if layer.compression_ratio != 2 or layer.mode != C.AttentionMode.REUSE:
+        return f"layer {layer_id} does not resolve to {KIND}"
     return None if KERNEL_READY else "C2A Reuse attention half-layer composition is pending"
 
 
@@ -783,7 +778,7 @@ def validate(argv=None):
                 specs,
                 make_golden(args.epochs),
                 comparisons(initial_state),
-                KIND.name,
+                KIND,
                 devices,
             )
         )
@@ -799,7 +794,7 @@ def validate(argv=None):
                 sharded,
                 make_golden_sharded(args.epochs),
                 comparisons_sharded(sharded_state),
-                f"{KIND.name} sequence-parallel",
+                f"{KIND} sequence-parallel",
                 devices,
             )
         )

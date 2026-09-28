@@ -14,7 +14,11 @@ into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 
 import pypto.language as pl
 
-from models.deepseek_v4_1_flash.config import FLASH as M, EP_SIZE as EP_WORLD_SIZE, RECV_MAX
+from models.deepseek_v4_1_flash.config import (
+    EP_SIZE as EP_WORLD_SIZE,
+    FLASH as M,
+    MOE_RECV_MAX as RECV_MAX,
+)
 
 DECODE_BATCH = 8
 DECODE_SEQ = 1
@@ -36,6 +40,7 @@ ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
 
 # tiling
 RECV_TILE = 16
+TILES_PER_EXPERT = RECV_MAX // RECV_TILE
 MX_GROUP = 32
 K_SCALE = D // MX_GROUP
 H_SCALE = MOE_INTER // MX_GROUP
@@ -99,6 +104,7 @@ def expert_routed(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
     mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
+    input_ready: pl.Scalar[pl.TASK_ID],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
@@ -107,6 +113,8 @@ def expert_routed(
         [N_LOCAL_EXPERTS * RECV_MAX, K_SCALE],
         layout=pl.MX_A_ZZ,
     )
+    hidden_completion_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
+    expert_completion_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
     with pl.scope():
         h_mx = pl.create_tensor(
             [N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.FP8E4M3FN
@@ -115,6 +123,9 @@ def expert_routed(
             [1, N_LOCAL_EXPERTS * RECV_MAX * H_SCALE], dtype=pl.FP8E8M0
         )
         for local_i in pl.parallel(N_LOCAL_EXPERTS):
+            tile_completion_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
+            for tile in pl.range(TILES_PER_EXPERT):
+                tile_completion_tids[tile] = pl.system.task_dummy(deps=[])
             flat_base = local_i * RECV_MAX
             routed_w1_packed_e = routed_w1_packed[local_i, :, :]
             routed_w3_packed_e = routed_w3_packed[local_i, :, :]
@@ -246,7 +257,7 @@ def expert_routed(
                             with pl.spmd(
                                 MOE_INTER // MX_MM_TASK_TILE,
                                 name_hint="exp_gate_mxfp4_aic",
-                                deps=[gate_mxfp4_aiv_tid],
+                                deps=[gate_mxfp4_aiv_tid, input_ready],
                             ) as gate_mxfp4_aic_tid:
                                 nb_idx = pl.tile.get_block_idx()
                                 n_base = nb_idx * MX_MM_TASK_TILE
@@ -290,7 +301,7 @@ def expert_routed(
                             with pl.spmd(
                                 MOE_INTER // MX_MM_TASK_TILE,
                                 name_hint="exp_up_mxfp4_aic",
-                                deps=[up_mxfp4_aiv_tid],
+                                deps=[up_mxfp4_aiv_tid, input_ready],
                             ) as up_mxfp4_aic_tid:
                                 nb_idx = pl.tile.get_block_idx()
                                 n_base = nb_idx * MX_MM_TASK_TILE
@@ -393,8 +404,15 @@ def expert_routed(
                                     [0, scale_offset],
                                     h_tile_scale_backing,
                                 )
+                            tile_completion_tids[t] = gate_up_act_quant_tid
+            hidden_completion_tids[local_i] = pl.system.task_dummy(
+                deps=[tile_completion_tids]
+            )
         with pl.scope():
             for local_e in pl.parallel(N_LOCAL_EXPERTS):
+                tile_completion_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
+                for tile in pl.range(TILES_PER_EXPERT):
+                    tile_completion_tids[tile] = pl.system.task_dummy(deps=[])
                 e_flat_base = local_e * RECV_MAX
                 routed_w2_packed_e = routed_w2_packed[local_e, :, :]
 
@@ -476,7 +494,7 @@ def expert_routed(
                             with pl.spmd(
                                 D // MX_W2_TASK_TILE,
                                 name_hint="exp_w2_mxfp4_aic",
-                                deps=[w2_mxfp4_aiv_tid],
+                                deps=[w2_mxfp4_aiv_tid, hidden_completion_tids[local_e]],
                             ) as w2_mxfp4_aic_tid:
                                 wb_idx = pl.tile.get_block_idx()
                                 d_base = wb_idx * MX_W2_TASK_TILE
@@ -521,7 +539,7 @@ def expert_routed(
                                 D // ROUTE_TASK_TILE,
                                 name_hint="exp_route_weight",
                                 deps=[w2_mxfp4_aic_tid],
-                            ):
+                            ) as route_weight_tid:
                                 wb_idx = pl.tile.get_block_idx()
                                 d_base = wb_idx * ROUTE_TASK_TILE
                                 w_row_blk = pl.load(
@@ -547,8 +565,18 @@ def expert_routed(
                                         recv_y_tile,
                                     )
                             recv_y_flat = pl.assemble(recv_y_flat, recv_y_tile, [flat_tt0, 0])
+                            tile_completion_tids[tt] = route_weight_tid
+                expert_completion_tids[local_e] = pl.system.task_dummy(
+                    deps=[tile_completion_tids]
+                )
 
-    return recv_y
+    expert_ready = pl.system.task_dummy(
+        deps=[
+            expert_completion_tids[local_e]
+            for local_e in range(N_LOCAL_EXPERTS)
+        ]
+    )
+    return recv_y, expert_ready
 
 
 @pl.jit
@@ -575,11 +603,12 @@ def expert_routed_test(
     mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
 ):
-    expert_routed(
+    input_ready = pl.system.task_dummy(deps=[])
+    recv_y, _expert_ready = expert_routed(
         recv_x, recv_mx_scale, recv_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale, mxfp4_pair_lut,
-        recv_y,
+        recv_y, input_ready,
     )
     return recv_y
 

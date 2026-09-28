@@ -44,13 +44,13 @@ LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 
 @pl.jit.inline
 def mhc_mixes(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor,
     function: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     scale: pl.Tensor[[3], pl.FP32],
     base: pl.Tensor[[MIX_HC], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    pre_mix: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE

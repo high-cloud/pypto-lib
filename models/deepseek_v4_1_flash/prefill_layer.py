@@ -75,6 +75,7 @@ from models.deepseek_v4_1_flash import config as C
 # gate.py and the EP transport freeze their token extent at import; the layer routes the
 # packed prefill tokens of one call.
 C.MOE_TOKENS = LAYER_TOKENS
+C.MOE_RECV_MAX = C.EP_SIZE * C.MOE_TOKENS
 
 from models.deepseek_v4_1_flash.config import (  # noqa: E402
     CMP_BLOCKS_DYN,
@@ -120,8 +121,6 @@ from models.deepseek_v4_1_flash.prefill_c2a_full import (  # noqa: E402
 from models.deepseek_v4_1_flash.prefill_c2a_reuse import prefill_c2a_reuse  # noqa: E402
 from models.deepseek_v4_1_flash.quantization import build_mxfp4_pair_lut  # noqa: E402
 from models.deepseek_v4_1_flash.rmsnorm import rms_norm as npu_rms_norm  # noqa: E402
-# Import moe before expert_routed: moe freezes C.RECV_MAX to this layer's token extent
-# before expert_routed captures the transport buffer shape in its annotations.
 from models.deepseek_v4_1_flash.moe import (  # noqa: E402
     AUX_WIDTH,
     EP_SIZE,
@@ -140,6 +139,7 @@ from models.deepseek_v4_1_flash.expert_routed import (  # noqa: E402
     ROUTED_DEQUANT_STD,
     gen_routed_mxfp4_weights,
 )
+from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD  # noqa: E402
 
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run  # noqa: E402
 from golden.validation import ratio_reldiff  # noqa: E402
@@ -277,10 +277,14 @@ def prefill_moe_sublayer(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
     ffn_input: pl.Tensor[[T_DYN, D], pl.BF16],
     ffn_owned: pl.Tensor[[T_DYN, D], pl.BF16],
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
@@ -854,10 +858,14 @@ def make_layer_program(capacity, world_size):
         recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
         recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
         recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-        arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-        data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+        arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
+        data_arrived: pld.DistributedTensor[
+            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+        ],
         routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
-        combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+        combine_arrived: pld.DistributedTensor[
+            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+        ],
         rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
         moe_epoch: pl.Scalar[pl.INT32],
@@ -974,10 +982,16 @@ def make_layer_program(capacity, world_size):
         recv_scale_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
         recv_weights_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
         recv_routes_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        arrived_buffer = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-        data_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+        arrived_buffer = pld.alloc_window_buffer(
+            [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32
+        )
+        data_arrived_buffer = pld.alloc_window_buffer(
+            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
+        )
         routed_output_buffer = pld.alloc_window_buffer([ROUTE_ROWS, D], dtype=pl.BF16)
-        combine_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+        combine_arrived_buffer = pld.alloc_window_buffer(
+            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
+        )
         for rank in pl.range(pld.world_size()):
             attention_data = pld.window(attention_buffer, [capacity, D], dtype=pl.FP32)
             attention_signal = pld.window(attention_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
@@ -1002,10 +1016,20 @@ def make_layer_program(capacity, world_size):
             recv_scale = pld.window(recv_scale_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
             recv_weights = pld.window(recv_weights_buffer, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
             recv_routes = pld.window(recv_routes_buffer, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-            arrived = pld.window(arrived_buffer, [EP_SIZE, 1], dtype=pl.INT32)
-            data_arrived = pld.window(data_arrived_buffer, [EP_SIZE, 1], dtype=pl.INT32)
+            arrived = pld.window(
+                arrived_buffer, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32
+            )
+            data_arrived = pld.window(
+                data_arrived_buffer,
+                [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
+                dtype=pl.INT32,
+            )
             routed_output = pld.window(routed_output_buffer, [ROUTE_ROWS, D], dtype=pl.BF16)
-            combine_arrived = pld.window(combine_arrived_buffer, [EP_SIZE, 1], dtype=pl.INT32)
+            combine_arrived = pld.window(
+                combine_arrived_buffer,
+                [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
+                dtype=pl.INT32,
+            )
             routed_w1_scale_r: pl.Tensor[
                 [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
             ] = routed_w1_scale[rank]

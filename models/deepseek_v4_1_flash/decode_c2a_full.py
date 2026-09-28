@@ -40,15 +40,10 @@ from models.deepseek_v4_1_flash.config import (
 from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
 from models.deepseek_v4_1_flash.decode_attn_c2a_full import decode_attn_c2a_full, decode_attn_c2a_full_sharded
 from models.deepseek_v4_1_flash.decode_common import attention_pre, slab_owner
-from models.deepseek_v4_1_flash.decode_layer_plan import (
-    DecodeLayerKind,
-    REPRESENTATIVE_LAYER_IDS,
-    resolve_decode_layer_plan,
-)
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 
-KIND = DecodeLayerKind.C2A_FULL
-REPRESENTATIVE_LAYER_ID = REPRESENTATIVE_LAYER_IDS[KIND]
+KIND = "C2A_FULL"
+REPRESENTATIVE_LAYER_ID = 2
 ATTENTION_GOLDEN = full.golden_decode_attn_c2a_full
 KERNEL_READY = True
 LEAF_NAMES = (*tuple(name for name in full.INPUT_NAMES if name != "x"), "topk_indices")
@@ -68,9 +63,9 @@ SHARDED_ATTENTION_SPEC_NAMES = (
 
 
 def skip_reason(layer_id=REPRESENTATIVE_LAYER_ID):
-    kind = resolve_decode_layer_plan(layer_id).kind
-    if kind != KIND:
-        return f"layer {layer_id} resolves to {kind.name}, expected {KIND.name}"
+    layer = C.FLASH.layer_config(layer_id)
+    if layer.compression_ratio != 2 or layer.mode != C.AttentionMode.FULL:
+        return f"layer {layer_id} does not resolve to {KIND}"
     return None if KERNEL_READY else "C2A Full attention half-layer composition is pending"
 
 
@@ -1065,7 +1060,7 @@ def validate(argv=None):
                 specs,
                 make_golden(args.epochs),
                 comparisons(),
-                KIND.name,
+                KIND,
                 devices,
             )
         )
@@ -1080,7 +1075,7 @@ def validate(argv=None):
                 sharded,
                 make_golden_sharded(args.epochs),
                 comparisons_sharded(),
-                f"{KIND.name} sequence-parallel",
+                f"{KIND} sequence-parallel",
                 devices,
             )
         )

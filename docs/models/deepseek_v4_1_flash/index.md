@@ -150,9 +150,9 @@ Prefill SWA Q-A projection also remains in
 
 ## Decode composition
 
-[decode_layer_plan.py](../../../models/deepseek_v4_1_flash/decode_layer_plan.py)
-resolves all six modes and source ownership from `FLASH.layer_config`. Each
-mode has an independently executable Attention half-layer entry:
+`FLASH.layer_config` is the single source of truth for all six modes and cache
+source ownership. Each mode has an independently executable Attention
+half-layer entry, while `decode_layer.py` composes the selected branch with MoE:
 
 | Mode | Attention kernel | Composition entry | Representative layer |
 | --- | --- | --- | ---: |
@@ -162,6 +162,13 @@ mode has an independently executable Attention half-layer entry:
 | C1A Full | `decode_attn_c1a_full.py` | `decode_c1a_full.py` | 20 |
 | C1A Reindex | `decode_attn_c1a_reindex.py` | `decode_c1a_reindex.py` | 24 |
 | C1A Reuse | `decode_attn_c1a_reuse.py` | `decode_c1a_reuse.py` | 21 |
+
+[`decode_fwd.py`](../../../models/deepseek_v4_1_flash/decode_fwd.py) expands the
+40-layer backbone directly from these six sharded composition entries and
+`moe`. It does not dispatch through `decode_layer.py`: the static layer order,
+cache-source ownership, residual ping-pong buffers, and per-layer communication
+epochs are visible in the forward itself. Its L3 entry allocates one set of TP
+Attention and EP MoE windows and reuses them across the complete backbone.
 
 Decode Attention is sequence parallel over the TP group: each rank owns a
 contiguous slab of the batch's token rows (`T_local = ceil(T / TP)`), the
