@@ -911,11 +911,11 @@ def test_decode_moe_orders_output_zero_before_combine_reduce():
         for node in ast.walk(moe_core)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "combine"
+        and node.func.id == "combine_scattered"
     )
     assert "_output_zero_tid" in {ast.unparse(arg) for arg in combine_call.args}
 
-    combine = _function(_tree("ep_transport.py"), "combine")
+    combine = _function(_tree("ep_transport.py"), "combine_scattered")
     reduce_spmd = next(
         node
         for node in ast.walk(combine)
@@ -933,18 +933,20 @@ def test_decode_moe_orders_output_zero_before_combine_reduce():
     assert "output_ready" in {ast.unparse(element) for element in deps.elts}
 
 
-def test_decode_moe_uses_isolated_epoch_slots_for_transport_signals():
+def test_decode_moe_uses_dspark_dispatch_and_accumulated_epochs():
     source = (MODEL_DIR / "ep_transport.py").read_text()
 
     assert "SIGNAL_PAD = 128" in source
     assert "[N_RANKS, N_LOCAL, SIGNAL_PAD]" in source
-    assert "offsets=[my_rank, loc_e, 0]" in source
-    assert "offsets=[src, loc_e, 0]" in source
-    assert "offsets=[my_rank, e, 0]" in source
-    assert "offsets=[src, e, 0]" in source
-    assert "value=moe_epoch, op=pld.NotifyOp.Set" in source
-    assert "pld.NotifyOp.AtomicAdd" not in source
-    assert "moe_epoch * N_LOCAL" not in source
+    assert "N_RANKS * N_LOCAL," in source
+    assert "offsets=[my_rank, 0, 0]" in source
+    assert "offsets=[src, 0, 0]" in source
+    assert "op=pld.NotifyOp.AtomicAdd" in source
+    assert "expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32)" in source
+    assert "pld.system.defer_wait(" in source
+    assert "op=pld.NotifyOp.Set" not in source
+    assert "for tile in pl.range(SCALE_PACK_TILES):" in source
+    assert "gather_tile_tids[tile] = pl.system.task_dummy(deps=[])" in source
 
 
 def test_prefill_layer_uses_decode_moe_transport_signal_layout():
@@ -980,13 +982,23 @@ def test_decode_moe_orders_dispatch_and_expert_completion_edges():
     assert "deps=[up_mxfp4_aiv_tid, input_ready]" in expert_source
     assert "tile_completion_tids[t] = gate_up_act_quant_tid" in expert_source
     assert "deps=[w2_mxfp4_aiv_tid, hidden_completion_tids[local_e]]" in expert_source
-    assert "tile_completion_tids[tt] = route_weight_tid" in expert_source
-    assert "return recv_y, expert_ready" in expert_source
+    assert "deps=[route_weight_tid]" in expert_source
+    assert 'name_hint="expert_tile_scatter"' in expert_source
+    assert "src=recv_y_tile" in expert_source
+    assert "tile_completion_tids[tt] = scatter_tid" in expert_source
+    assert 'name_hint="expert_tile_store"' not in expert_source
+    assert "return scatter_done" in expert_source
 
     moe_source = (MODEL_DIR / "moe.py").read_text()
     assert "input_ready = dispatch(" in moe_source
-    assert "routed_y, expert_ready = expert_routed(" in moe_source
-    assert "_output_zero_tid, expert_ready," in moe_source
+    assert "scatter_done = expert_routed_scatter(" in moe_source
+    assert "combine_scattered(" in moe_source
+    assert "_output_zero_tid,\n            scatter_done," in moe_source
+
+    for entry in ("decode_layer.py", "decode_fwd.py", "prefill_layer.py"):
+        source = (MODEL_DIR / entry).read_text()
+        assert "from models.deepseek_v4_1_flash.moe import (" in source
+        assert "moe_dspark" not in source
 
 
 @requires_pypto

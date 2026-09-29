@@ -6,14 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4.1 MoE routed local expert compute (decode, EP single-card).
+"""DeepSeek-V4.1 routed expert compute with immediate distributed scatter.
 
 Only the routed-expert path lives here. The shared expert was split out
 into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 """
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 
+from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.config import (
     EP_SIZE as EP_WORLD_SIZE,
     FLASH as M,
@@ -82,7 +84,7 @@ SWIGLU_SCALE_TMP = ((64 + (RECV_TILE // 16) * SWIGLU_GROUPS + 31) // 32) * 32
 
 
 @pl.jit.inline(auto_scope=False)
-def expert_routed(
+def expert_routed_scatter(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
     recv_mx_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
@@ -103,10 +105,11 @@ def expert_routed(
     ],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
     mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
-    recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
+    recv_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
+    recv_meta: pl.Tensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
     input_ready: pl.Scalar[pl.TASK_ID],
 ):
-    recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     recv_mx_scale_view = pl.tensor.view(
         recv_mx_scale,
@@ -564,53 +567,48 @@ def expert_routed(
                                         [0, d0],
                                         recv_y_tile,
                                     )
-                            recv_y_flat = pl.assemble(recv_y_flat, recv_y_tile, [flat_tt0, 0])
-                            tile_completion_tids[tt] = route_weight_tid
+                            with pl.at(
+                                level=pl.Level.CORE_GROUP,
+                                name_hint="expert_tile_scatter",
+                                deps=[route_weight_tid],
+                                no_dep_args=[routed_output],
+                            ) as scatter_tid:
+                                tile_end = tt0 + valid_rows
+                                source_begin = pl.cast(0, pl.INDEX)
+                                for src in pl.range(EP_WORLD_SIZE):
+                                    source_rows = pl.cast(
+                                        pl.read(recv_meta, [src, local_e]),
+                                        pl.INDEX,
+                                    )
+                                    source_end = source_begin + source_rows
+                                    scatter_begin = pl.max(tt0, source_begin)
+                                    scatter_end = pl.min(tile_end, source_end)
+                                    for compact_row in pl.range(scatter_begin, scatter_end):
+                                        route = pl.cast(
+                                            pl.read(recv_route, [local_e, compact_row]),
+                                            pl.INDEX,
+                                        )
+                                        pld.tensor.put(
+                                            dst=routed_output,
+                                            peer=src,
+                                            src=recv_y_tile,
+                                            dst_offsets=[route, 0],
+                                            src_offsets=[compact_row - tt0, 0],
+                                            shape=[1, D],
+                                        )
+                                    source_begin = source_end
+                            tile_completion_tids[tt] = scatter_tid
                 expert_completion_tids[local_e] = pl.system.task_dummy(
                     deps=[tile_completion_tids]
                 )
 
-    expert_ready = pl.system.task_dummy(
+    scatter_done = pl.system.task_dummy(
         deps=[
             expert_completion_tids[local_e]
             for local_e in range(N_LOCAL_EXPERTS)
         ]
     )
-    return recv_y, expert_ready
-
-
-@pl.jit
-def expert_routed_test(
-    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
-    recv_mx_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
-    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    routed_w1_packed: pl.Tensor[
-        [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
-        pl.UINT8,
-    ],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3_packed: pl.Tensor[
-        [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
-        pl.UINT8,
-    ],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2_packed: pl.Tensor[
-        [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
-        pl.UINT8,
-    ],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
-    recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
-):
-    input_ready = pl.system.task_dummy(deps=[])
-    recv_y, _expert_ready = expert_routed(
-        recv_x, recv_mx_scale, recv_weights, recv_expert_count,
-        routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
-        routed_w2_packed, routed_w2_scale, mxfp4_pair_lut,
-        recv_y, input_ready,
-    )
-    return recv_y
+    return scatter_done
 
 
 def golden_expert_routed(tensors):
@@ -933,53 +931,4 @@ def active_recv_ratio_reldiff(*, diff_thd, pct_thd):
         f"active_recv_ratio_reldiff(diff_thd={diff_thd}, pct_thd={pct_thd})"
     )
     return compare
-
-
-if __name__ == "__main__":
-    # Drop this model directory when run as a script so the local golden.py does
-    # not shadow the repository golden package.
-    import pathlib
-    import sys
-    _model_dir = pathlib.Path(__file__).resolve().parent
-    sys.path = [item for item in sys.path if pathlib.Path(item or ".").resolve() != _model_dir]
-    import argparse
-    from golden.runner import run
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a5",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    parser.add_argument("--dump-passes", action="store_true", default=False)
-    parser.add_argument("--save-data", action="store_true", default=False)
-    parser.add_argument("--golden-data", type=str, default=None)
-    args = parser.parse_args()
-
-    result = run(
-        fn=expert_routed_test,
-        specs=build_tensor_specs(),
-        golden_fn=golden_expert_routed,
-        golden_data=args.golden_data,
-        save_data=args.save_data,
-        config=dict(
-            dump_passes=args.dump_passes,
-            platform=args.platform,
-            device_id=args.device,
-            # Routed MX expert keeps all local experts and large activation
-            # tiles live in one invocation; the default 256 MiB ring heap can
-            # deadlock before the kernel starts on a5.
-            ring_heap=1_073_741_824,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            # BF16 recv_y, ~1 ULP. Gen weights reproduce real(L21): 0.016% vs 0.015% of points > 1e-3.
-            "recv_y": active_recv_ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
 

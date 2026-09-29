@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: a5
-"""Expert-parallel MoE dispatch, local expert compute, and routed-output combine."""
+"""DSpark-style expert-parallel MoE with immediate routed-output scatter."""
 
 import math
 import sys
@@ -43,9 +43,9 @@ from models.deepseek_v4_1_flash.expert_routed import (
     MX_W1_PACKED_ROWS,
     MX_W2_PACKED_ROWS,
     MX_W3_PACKED_ROWS,
-    expert_routed,
+    expert_routed_scatter,
 )
-from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD, combine, dispatch
+from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD, combine_scattered, dispatch
 from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
 from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post_after
@@ -150,20 +150,27 @@ def _moe_core(
             arrived, data_arrived, num_tokens, ep_rank, moe_epoch,
         )
 
-        routed_y = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.BF16)
-        # dispatch already filled this backing; expert_routed views it as MX_A_ZZ.
-        routed_y, expert_ready = expert_routed(
+        scatter_done = expert_routed_scatter(
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_count_local,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale, mxfp4_pair_lut,
-            routed_y, input_ready,
+            recv_route_local,
+            recv_meta_local,
+            routed_output,
+            input_ready,
         )
-        # combine writes the final output directly: a dynamically shaped intermediate
-        # would escape its defining scope during PTOAS SSA conversion.
-        output_ready = combine(routed_y, recv_route_local, shared_output, output, recv_meta_local,
-                               routed_output, combine_arrived, _output_zero_tid, expert_ready,
-                               num_tokens, ep_rank, moe_epoch)
+        output_ready = combine_scattered(
+            shared_output,
+            output,
+            routed_output,
+            combine_arrived,
+            _output_zero_tid,
+            scatter_done,
+            num_tokens,
+            ep_rank,
+            moe_epoch,
+        )
     return output_ready
 
 
@@ -1061,6 +1068,7 @@ def validate(argv=None):
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--enable-dep-gen", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--log-level", type=str, default=None)
@@ -1119,6 +1127,7 @@ def validate(argv=None):
                 num_sub_workers=0,
             ),
             platform=args.platform,
+            enable_dep_gen=args.enable_dep_gen,
             enable_chip_swimlane=args.enable_chip_swimlane,
             # The complete mHC+MoE block keeps dispatch buffers, FP8 routed
             # staging, shared matmul, and distributed windows live together.
