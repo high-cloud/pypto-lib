@@ -134,6 +134,11 @@ FWD_INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
 # model config
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
 FWD_NUM_LAYERS = 43
+DEBUG_LAYER_TRACE = os.environ.get("PYPTO_DSPARK_DEBUG_LAYER_TRACE") == "1"
+DEBUG_ALL_TOKENS = DEBUG_LAYER_TRACE and os.environ.get("PYPTO_DSPARK_DEBUG_LAYER_TRACE_ALL_TOKENS") == "1"
+DEBUG_STAGE_ROWS = 20 if DEBUG_ALL_TOKENS else (FWD_NUM_LAYERS * 2 if DEBUG_LAYER_TRACE else 1)
+DEBUG_TOKEN_ROWS = 32 if DEBUG_ALL_TOKENS else 1
+DEBUG_TRACE_WIDTH = DEBUG_TOKEN_ROWS * HC_DIM
 CSA_NUM_LAYERS = 21
 HCA_NUM_LAYERS = 20
 CSA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE
@@ -249,6 +254,39 @@ RESIDENT_CACHE_NAMES = frozenset(CACHE_NAMES)
 
 # Caches returned to the following decode invocation.
 RESIDENT_CACHE_OUTPUT_NAMES = RESIDENT_CACHE_NAMES
+
+
+@pl.jit.inline
+def capture_debug_stage(
+    x: pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32],
+    trace: pl.Tensor[[DEBUG_STAGE_ROWS, DEBUG_TRACE_WIDTH], pl.FP32],
+    tokens: pl.Scalar[pl.INT32],
+    stage: pl.Scalar[pl.INT32],
+):
+    x.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
+    rows = pl.tensor.dim(x, 0)
+    flat = pl.reshape(x, [rows, HC_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_capture_layer_stage"):
+        if tokens > 0:
+            if stage < DEBUG_STAGE_ROWS:
+                for token in pl.range(DEBUG_TOKEN_ROWS):
+                    source_row = pl.cast(tokens - 1, pl.INDEX)
+                    if DEBUG_ALL_TOKENS:
+                        source_row = pl.cast(token, pl.INDEX)
+                    for column in pl.range(0, HC_DIM, 1024):
+                        destination = token * HC_DIM + column
+                        if source_row < tokens:
+                            trace[stage:stage + 1, destination:destination + 1024] = flat[
+                                source_row:source_row + 1, column:column + 1024
+                            ]
+                        else:
+                            trace[stage:stage + 1, destination:destination + 1024] = pl.full(
+                                [1, 1024], dtype=pl.FP32, value=0.0
+                            )
+            # Keep the sampled activation alive until its diagnostic copy is complete.
+            anchor = pl.read(x, [0, 0, 0])
+            pl.write(x, [0, 0, 0], anchor)
+    return trace, x
 
 
 @pl.jit.incore
@@ -392,6 +430,7 @@ def prefill_fwd(
     Query boundaries must agree across each TP/CP group. Empty groups retain
     the physical token shape and participate in every EP MoE wave.
     """
+    debug_trace = pl.create_tensor([DEBUG_STAGE_ROWS, DEBUG_TRACE_WIDTH], dtype=pl.FP32)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
     hca_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
@@ -507,6 +546,8 @@ def prefill_fwd(
                 )
 
         with pl.scope():
+            if DEBUG_LAYER_TRACE:
+                capture_debug_stage(attn_stage, debug_trace, group_tokens, layer_l0 * 2)
             prefill_moe(
                 attn_stage,
                 hc_ffn_fn_l0, hc_ffn_scale_l0, hc_ffn_base_l0,
@@ -522,6 +563,8 @@ def prefill_fwd(
                 gather_window, gather_signal,
                 group_base, tp_rank, layer_l0, my_rank, group_tokens,
             )
+            if DEBUG_LAYER_TRACE:
+                capture_debug_stage(x_hc, debug_trace, group_tokens, layer_l0 * 2 + 1)
 
     # Layer 1: SWA.
     with pl.scope():
@@ -599,6 +642,8 @@ def prefill_fwd(
                 )
 
         with pl.scope():
+            if DEBUG_LAYER_TRACE:
+                capture_debug_stage(attn_stage, debug_trace, group_tokens, layer_l1 * 2)
             prefill_moe(
                 attn_stage,
                 hc_ffn_fn_l1, hc_ffn_scale_l1, hc_ffn_base_l1,
@@ -614,6 +659,8 @@ def prefill_fwd(
                 gather_window, gather_signal,
                 group_base, tp_rank, layer_l1, my_rank, group_tokens,
             )
+            if DEBUG_LAYER_TRACE:
+                capture_debug_stage(x_hc, debug_trace, group_tokens, layer_l1 * 2 + 1)
 
     group_rows = pl.tensor.dim(x_hc, 0)
     local_tokens = pl.tensor.dim(input_ids, 0)
@@ -763,6 +810,8 @@ def prefill_fwd(
                     )
 
             with pl.scope():
+                if DEBUG_LAYER_TRACE:
+                    capture_debug_stage(attn_stage, debug_trace, group_tokens, csa_layer * 2)
                 prefill_moe(
                     attn_stage,
                     hc_ffn_fn_csa, hc_ffn_scale_csa, hc_ffn_base_csa,
@@ -778,6 +827,8 @@ def prefill_fwd(
                     gather_window, gather_signal,
                     group_base, tp_rank, csa_layer, my_rank, group_tokens,
                 )
+                if DEBUG_LAYER_TRACE:
+                    capture_debug_stage(x_hc, debug_trace, group_tokens, csa_layer * 2 + 1)
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
                         target_x_hc_l40 = pl.slice(
@@ -894,6 +945,8 @@ def prefill_fwd(
                     )
 
             with pl.scope():
+                if DEBUG_LAYER_TRACE:
+                    capture_debug_stage(attn_stage, debug_trace, group_tokens, hca_layer * 2)
                 prefill_moe(
                     attn_stage,
                     hc_ffn_fn_hca, hc_ffn_scale_hca, hc_ffn_base_hca,
@@ -909,6 +962,8 @@ def prefill_fwd(
                     gather_window, gather_signal,
                     group_base, tp_rank, hca_layer, my_rank, group_tokens,
                 )
+                if DEBUG_LAYER_TRACE:
+                    capture_debug_stage(x_hc, debug_trace, group_tokens, hca_layer * 2 + 1)
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
                         target_x_hc_l41 = pl.slice(
@@ -1063,6 +1118,8 @@ def prefill_fwd(
                 )
 
         with pl.scope():
+            if DEBUG_LAYER_TRACE:
+                capture_debug_stage(attn_stage, debug_trace, group_tokens, layer_last * 2)
             prefill_moe(
                 attn_stage,
                 hc_ffn_fn_last, hc_ffn_scale_last, hc_ffn_base_last,
@@ -1078,6 +1135,8 @@ def prefill_fwd(
                 gather_window, gather_signal,
                 group_base, tp_rank, layer_last, my_rank, group_tokens,
             )
+            if DEBUG_LAYER_TRACE:
+                capture_debug_stage(x_hc, debug_trace, group_tokens, layer_last * 2 + 1)
 
     with pl.scope():
         clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
@@ -1120,6 +1179,21 @@ def prefill_fwd(
                 pl.const(LM_HEAD_COMM_EPOCH, pl.INT32), final_norm_tid,
             )
             greedy_sample(logits, logit_row_indices, sampled_ids)
+            if DEBUG_LAYER_TRACE:
+                debug_logits_flat = pl.reshape(logits, [1, MAX_LOGIT_ROWS * LM_HEAD_VOCAB])
+                for stage in pl.spmd(DEBUG_STAGE_ROWS, name_hint="dspark_export_layer_trace"):
+                    sample = pl.read(sampled_ids, [0, 0])
+                    if sample >= 0:
+                        for column in pl.range(0, DEBUG_TRACE_WIDTH, 1024):
+                            if DEBUG_ALL_TOKENS:
+                                destination = LM_HEAD_VOCAB + stage * DEBUG_TRACE_WIDTH + column
+                                debug_logits_flat[0:1, destination:destination + 1024] = debug_trace[
+                                    stage:stage + 1, column:column + 1024
+                                ]
+                            else:
+                                logits[stage + 1:stage + 2, column:column + 1024] = debug_trace[
+                                    stage:stage + 1, column:column + 1024
+                                ]
         else:
             for token in pl.spmd(local_tokens, name_hint="prefill_fwd_inactive_target_hidden"):
                 for head in pl.range(MAIN_HIDDEN_DIM // D):

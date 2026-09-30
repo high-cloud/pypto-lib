@@ -829,7 +829,9 @@ def moe_test(
 
 # Rounds sharing one window allocation. >1 exercises retained-window reuse
 # across MoE epochs; the round axis is kept even at 1.
-MOE_ROUNDS = 1
+MOE_ROUNDS = _parse_int_argv("--moe-rounds", 1)
+if MOE_ROUNDS < 1:
+    raise ValueError("--moe-rounds must be positive")
 
 
 @pl.jit.host
@@ -1365,10 +1367,18 @@ def build_rounds_tensor_specs(layer_id=0, num_tokens=T, routing="uniform"):
     return _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds=MOE_ROUNDS)
 
 
+def compare_moe_rounds(num_tokens):
+    """Keep inactive shared-only rows out of the routed-output error fraction."""
+    from golden import ratio_reldiff
+
+    active = max(0, min(T, int(num_tokens)))
+    return ratio_reldiff(diff_thd=3e-3, pct_thd=0.05, valid_rows=active or None, valid_axis=2)
+
+
 if __name__ == "__main__":
     import argparse
 
-    from golden import ratio_reldiff, run
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1380,6 +1390,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--moe-rounds", type=int, default=MOE_ROUNDS,
+                        help="consecutive fixture rounds sharing communication windows")
     parser.add_argument("--num-tokens", type=int, default=T,
                         help=f"active token count for MoE dispatch/combine (0..{T})")
     parser.add_argument("--routing", type=str, default="uniform", choices=ROUTING_CHOICES,
@@ -1431,7 +1443,7 @@ if __name__ == "__main__":
             # BF16 x_next. Tightened 5e-3 -> 3e-3 with the real layer-0 hc_ffn
             # gate (~2.1% of points > 3e-3). No max_diff_hd (near-zero
             # residual/FFN cancellations blow up relatively).
-            "x_next": ratio_reldiff(diff_thd=3e-3, pct_thd=0.05),
+            "x_next": compare_moe_rounds(args.num_tokens),
         },
     )
     if not result.passed:
