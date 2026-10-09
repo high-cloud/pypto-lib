@@ -137,11 +137,10 @@ def _prefill_cp_token_allgather_step(
     ):
         completion_anchor = pl.read(group_out, [0, 0])
         reset_value = pl.cast(-2, pl.INT32)
-        self_rank = group_base + tp_rank
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
                 pld.system.notify(
-                    target=gather_signal, peer=self_rank,
+                    target=gather_signal, peer=group_base + tp_rank,
                     offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
                 )
         pl.write(group_out, [0, 0], completion_anchor)
