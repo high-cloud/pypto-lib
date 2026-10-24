@@ -5,7 +5,7 @@ Use [PROMPT.md](PROMPT.md) as the Main Agent prompt and
 one topology, and one quantization policy. Track progress with a short checklist
 in `TASKS.md`; no workflow engine or state machine is required.
 
-Copy the [templates](templates/) into an experiment directory. Set local paths
+Copy the [templates listed below](#files) into an experiment directory. Set local paths
 through environment variables or an ignored local input file. Keep checkpoints
 read-only, outside the experiment. Store logs, fixtures, and generated builds
 under the experiment's local artifact directory.
