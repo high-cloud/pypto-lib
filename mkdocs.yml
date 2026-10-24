@@ -99,6 +99,17 @@ nav:
           - Model overview: models/deepseek_v4_1_flash/index.md
           - Vision encoder and visual aligner: models/deepseek_v4_1_flash/vision.md
       - GLM-5.3-Flash: models/glm5_3_flash/index.md
+  - Model Development:
+      - Overview: model-development/README.md
+      - Main agent prompt: model-development/PROMPT.md
+      - Module worker prompt: model-development/WORKER_PROMPT.md
+      - Templates:
+          - Model specification: model-development/templates/MODEL_SPEC.md
+          - Modules and composition: model-development/templates/MODULES.md
+          - Acceptance criteria: model-development/templates/ACCEPTANCE.md
+          - Weight mapping: model-development/templates/WEIGHT_MANIFEST.md
+          - Future serving ABI: model-development/templates/SERVING_ABI.md
+          - Experiment log: model-development/templates/TASKS.md
   - Debug and Tune:
       - Overview: debug-and-tune/index.md
       - Debugging: debug-and-tune/debugging.md

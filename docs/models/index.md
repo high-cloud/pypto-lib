@@ -4,6 +4,8 @@
 Files ending in `_draft.py` are work in progress and are not part of the
 tracked runnable set.
 
+For a new model, use the [goal-driven implementation prompt and templates](../model-development/README.md).
+
 | Directory | What it implements | `pypto-serving` |
 | --- | --- | --- |
 | [qwen3_14b](qwen3_14b/index.md) | Qwen3-14B BF16 prefill and decode with the serving contract, plus A8W8 and TurboQuant variants and the sampling components | Supported — one-card A2/A3 accuracy |
