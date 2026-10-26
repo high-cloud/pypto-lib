@@ -15,20 +15,27 @@ the launcher is not a required reviewer. Record lifecycle limitations accurately
 
 - [ ] Model facts and environment inspected
 - [ ] Concrete specification reviewed and agreed by user
+- [ ] File ownership, goldens, default validation, comparators, and consumers mapped before implementation
+- [ ] Prefill/decode loop nesting, token tiles, and dispatch granularity frozen
 - [ ] Pinned checkpoint availability and per-rank peak memory feasibility verified
 - [ ] Generation cases calibrated on the original model and frozen before candidate runs
 - [ ] Native implementation goal active in the owner thread
 - [ ] Independent references and fixtures prepared
+- [ ] First attention and MoE/feed-forward paths checked against model rules before full-stack expansion
 - [ ] Modules independently accepted
 - [ ] Half-layers / representative layers accepted
 - [ ] Prefill and consecutive decode composed
 - [ ] Complete-model PyPTO prefill/decode source entries delivered and compiled
 - [ ] Generated graph coverage and weight/state interfaces verified
+- [ ] Actual compiled prefill/decode structure checked at representative shapes
+- [ ] Tokenwise complete-stack negative control rejected by the structural check
 - [ ] Persistent-state handoff checked
 - [ ] Distributed routing/combine and unequal EOS/state isolation checked when in scope
 - [ ] Real-weight mapping checked
 - [ ] Real-device generation through compiled model entries accepted
 - [ ] Future serving ABI documented
+- [ ] Final ownership and validation-to-composition symbols/variants verified; obsolete paths accounted for
+- [ ] Bounded default validation and applicable existing CI discovery checks executed
 - [ ] Every agreed requirement mapped to passing evidence on delivered revision
 - [ ] Owner recorded actual native goal completion
 
@@ -40,6 +47,9 @@ the launcher is not a required reviewer. Record lifecycle limitations accurately
 
 Include every agreed requirement. Keep optional diagnostics separate. Continue
 work on unmet implementable rows instead of handing acceptance to the launcher.
+Include engineering findings from the first working paths and final closeout;
+record their resolution and actual validation/discovery results. Numerical or
+generation passes do not close unresolved structural findings.
 
 ## Evidence
 

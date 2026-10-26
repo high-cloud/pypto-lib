@@ -6,7 +6,8 @@ prefill/decode forwards, and reproducible real-checkpoint text generation on the
 agreed NPU topology. The user has requested goal-driven execution. Use the
 host's native goal facility when available, following the lifecycle below.
 Do not invent Goal Plus/Search bindings. No state machine or performance
-optimization is needed.
+optimization is needed. Preserving the model's prefill/decode execution structure
+is a required delivery gate even when performance tuning is out of scope.
 
 ## Ownership and goal lifecycle
 
@@ -21,7 +22,8 @@ semantics; acceptance does not require a separate parent agent.
 Prepare the specification before activating the implementation goal. After user
 agreement, read the current native goal and create it only if none exists. Its
 objective must cover every agreed deliverable and acceptance gate, including
-complete-model compiled prefill/decode entries and generation through them.
+complete-model compiled prefill/decode entries, engineering and execution-structure
+acceptance, and generation through them.
 Preserve an existing goal's identity and historical evidence when resuming.
 Verify actual host status and a running owner turn; sending a continuation
 prompt or editing a checklist does not prove that native continuation resumed.
@@ -54,14 +56,21 @@ one agreed hardware topology and one agreed quantization policy. Quantization
 may differ from the checkpoint if its conversion and acceptance are agreed.
 Compilation, memory capacity, loading, and continued execution are functional
 requirements even though performance is out of scope.
+Multi-token prefill is also a structural requirement, not an optional speedup.
+Do not infer permission to serialize the entire model from the absence of a
+latency or throughput target.
 
 Define the future serving ABI now. Implementing or running pypto-serving is
 outside this goal. Inspect its actual contract when available and record its
 revision; otherwise label unresolved integration assumptions explicitly.
 
-Read `AGENTS.md`, `.claude/CLAUDE.md`, relevant rules and skills, and the current
-coding guides before editing kernels. Follow the setup workflow before compile
-or execution and the task-submit skill for all NPU execution. Verify the actual
+Read `AGENTS.md`, `.claude/CLAUDE.md`, the
+[model implementation rules](../../.claude/rules/models.md), and the relevant
+workflows and coding guides before editing kernels. Those rules own file
+organization, dependency direction, reuse, composition depth, and default
+validation; this workflow records their application and acceptance evidence.
+Follow the setup workflow before compile or execution and the task-submit skill
+for all NPU execution. Verify the actual
 import paths and toolchain pins. Keep machine paths and raw artifacts local.
 
 ## 1. Agree on specifications
@@ -76,6 +85,26 @@ Fill `MODEL_SPEC.md`, `MODULES.md`, `ACCEPTANCE.md`, `WEIGHT_MANIFEST.md`, and
 text-only versus multimodal), one topology/rank mapping, one quantization
 policy, supported shapes, module boundaries, and numerical gates. Estimate
 weight, persistent-state, and scratch memory. Represent unknown facts as unknown.
+
+Before implementation, fill the file-ownership and validation map in `MODULES.md`:
+each operator's owning source/symbol, corresponding golden, default executable
+validation command, existing comparator, and actual composition consumers.
+Identify phase-specific implementations and shared children, along with their
+responsibilities. Account for numerical primitives and host utilities under
+their actual owners. Keep default correctness checks reproducible from repository
+sources; experiment artifacts may supply frozen data and logs, not the sole copy
+of required validation code. Update this map with the implementation.
+
+Freeze an execution contract for both phases: loop nesting, logical token axes,
+token tile sizes, projection/attention/expert operand shapes, state transitions,
+and distributed dispatch granularity. By default, prefill processes multiple
+prompt tokens within each layer; decode processes the current active tokens.
+Tiled prefill and model-required causal/recurrent scans are allowed, but a
+one-token outer loop invoking the entire decoder stack is a diagnostic path,
+not an accepted prefill implementation. A shared helper or two entry filenames
+does not establish distinct phase behavior. Any reduced tokenwise-only scope
+requires an explicit user decision; the agent cannot authorize it in its own
+specification or derive it from numerical similarity.
 
 For distributed models, write a rank table and separate the physical world from
 the attention, expert, tensor, and pipeline groups. DP and EP may reuse the same
@@ -153,6 +182,18 @@ Specify input/output shape, dtype, layout, direction, dynamic dimensions,
 rank-local partition, ownership, persistent-state updates, and weights at every
 boundary. Validate outputs and state mutations, including untouched regions.
 
+Check engineering structure on the first working attention path and the first
+MoE path (feed-forward path for a dense model), before expanding the full stack.
+Use bounded fixtures through the same compute symbols and compile-time variants
+that composition will call. Record the import/call graph, ownership map, default
+validation command/result, and effective prefill/decode shapes. Check them against
+the model rules; explain any permitted extra call depth with its computation or
+scheduling responsibility. Compare validation and composition call paths explicitly:
+matching file hashes alone do not prove the same implementation was exercised.
+For hybrid models, apply the check as each distinct mixer becomes executable.
+Fix structural violations before scaling this pattern to further layers. The
+owner performs this check without waiting for an external parent review.
+
 For MoE, validate routing scores/normalization and selected IDs separately from
 expert math. Cover local-only, remote-only, mixed and skewed expert loads, repeated
 token destinations, zero receives, and every selected route's scatter/gather weight.
@@ -176,6 +217,31 @@ separate tasks; this does not require one fused device kernel. Python loops that
 submit each operator individually, aliases, and placeholder files do not satisfy
 the complete-model compilation contract.
 
+Before expensive complete-model generation, reuse existing validation entries and
+inspection tooling for a runnable execution-structure check of the actual compiled
+entries. Add only the model-specific shape/nesting checks missing from that tooling;
+keep them with the owning validation entry instead of creating another execution
+or comparison framework. Inspect source call paths and generated IR/task graphs,
+including effective operand shapes and loop
+nesting after helper expansion. For a supported multi-token fixture, prove that
+prefill projections and feed-forward/expert work retain a token tile greater than
+one, and that attention/recurrent work follows the declared phase algorithm.
+Check the same source path at more than one supported length. Necessary recurrence,
+causal scans, and tiling must be distinguished from serializing the entire stack.
+Count logical prompt tokens, not heads, routes from one token, or padded rows.
+For sparse experts, individual one-row or empty expert groups are valid; include
+a repeated-expert fixture that proves multiple tokens can be grouped together.
+Recompute MoE receive capacity for the actual dispatched token tile and worst-case
+expert skew; a two-token decode buffer does not accept multi-token prefill.
+
+Validate the check with a negative control that wraps the complete decode stack
+in a prompt-token loop; it must fail the prefill structural gate even if its
+numerical outputs and generation pass. Renamed entries must not evade this check,
+and missing or unrecognized compiled evidence cannot pass. Save commands, actual
+results, source/build hashes, inspected loop/shape evidence, and negative-control
+rejection. File names, kernel-name presence, self-declared flags, and compilation
+alone are insufficient. The owner executes this check; no parent review is needed.
+
 Record source hashes, entry symbols, compile commands, generated IR/task-graph
 paths and coverage, ordered weight/state arguments, and runtime invocation paths.
 Validate the actual entries on the agreed device. Source presence and compilation
@@ -184,7 +250,9 @@ alone do not establish numerical or generation acceptance.
 Check multi-layer composition with small fixtures when practical. Verify that
 decode consumes the state created by prefill and advances positions and lengths
 correctly. Cover KV cache and any recurrent, convolutional, or other model state.
-Only require chunking, batching, or extra modes that the user agreed to support.
+Multi-token processing within one prompt is required prefill behavior. Extra
+modes such as continuous batching across requests or streaming prefill require
+separate scope agreement.
 
 Distributed acceptance must run on the exact physical card count. Exercise both
 ranks with different requests, rank-local state isolation, cross-card expert work,
@@ -236,9 +304,19 @@ result. Keep required gates separate from optional diagnostics. After any source
 change, rerun affected gates and downstream composition/generation checks; reports
 from an older execution path do not accept a replacement model entry.
 
+At closeout, verify the final ownership map and validation-to-composition symbol
+mapping, account for replaced paths and remaining consumers, and run the applicable
+default correctness entries and existing CI discovery checks. Record their actual
+results and any explicit device-only classification. A checkpoint generation
+driver does not replace discoverable bounded operator validation. Permanent
+validation code must be in repository sources. Keep unresolved engineering rows
+open even when numerical checks and generation pass. Do not create a parallel
+model test framework under `tests/` to satisfy this workflow.
+
 Close the goal yourself only when every required row passes on the delivered
 revision: module numerical gates, complete-model compiled entry delivery, state
-handoff, weight completeness, real-device generation through those entries, and
+handoff, engineering acceptance and execution-structure negative-control rejection,
+weight completeness, real-device generation through those entries, and
 agreed documentation. Optional full-model golden does not make model delivery
 optional. Save the actual native completion result and a concise final report.
 If a required row is still unmet and work can proceed, continue within the goal.

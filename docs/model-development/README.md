@@ -43,6 +43,30 @@ alongside module numerical gates and state/weight checks. The owner maps each
 requirement to current evidence and records the actual native completion result.
 Keep this process in the existing documents and checklist.
 
+Apply the [model implementation rules](../../.claude/rules/models.md) through
+three checkpoints: map file ownership, goldens, default validation and consumers
+before implementation; check the first working attention and MoE/feed-forward
+paths before full-stack expansion; verify final ownership, validation-to-composition
+symbols, replacement cleanup and default validation/discovery before goal closeout.
+The model agent owns these checks. Keep evidence in `MODULES.md` and `TASKS.md`;
+reuse the existing harness, comparators and inspection tools. Model-specific
+checks extend the owning validation entry instead of creating another framework.
+Permanent validation code belongs in repository sources; artifacts may hold frozen
+fixtures and execution records. Numerical or generation passes do not waive
+engineering findings.
+
+Execution structure is a separate required gate. Multi-token prefill must retain
+prompt-token tiles within each layer's projections and feed-forward work;
+model-required recurrence and tiled scheduling are allowed. An outer token loop
+through the complete decoder stack is diagnostic-only by default. Excluding
+performance tuning does not authorize that substitution. Shared helpers are
+allowed only with verified phase-dependent behavior. The owner checks actual
+source and generated loop/shape evidence and proves that its runnable structural
+check, integrated with existing validation, rejects a tokenwise complete-stack
+negative control. This gate does not
+require a parent reviewer or a latency target. See the
+[execution-structure gates](templates/ACCEPTANCE.md#execution-structure-gates).
+
 Before the implementation goal, verify checkpoint/device memory feasibility and
 calibrate generation fixtures against the original model with the intended chat
 messages and token budget. Freeze numerical gates and generation semantics

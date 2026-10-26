@@ -83,6 +83,13 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
   boundaries, sharding, and state ownership. Do not silently change interfaces,
   relax acceptance criteria, or claim support beyond the implemented and
   validated configurations.
+- Preserve phase execution structure: multi-token prefill retains token tiles
+  within layers, including projections and feed-forward work. Necessary causal
+  or recurrent scans and tiled scheduling are allowed. A prompt-token loop
+  through the complete decoder stack is diagnostic-only unless the user
+  explicitly agrees to that reduced scope. Excluding performance tuning does
+  not authorize this substitution; shared helpers must satisfy each phase's
+  execution contract.
 - Executable operator files use the existing
   [golden harness](../../docs/run-and-validate/golden-harness.md). Their default
   invocation provides bounded correctness coverage of relevant shapes,

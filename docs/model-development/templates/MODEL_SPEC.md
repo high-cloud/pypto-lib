@@ -11,6 +11,10 @@
 - Memory estimate (weights, state, scratch):
 - Goal owner thread and agreed implementation objective:
 - Prefill/decode source paths, callable signatures, and compilation boundary:
+- Prefill/decode execution contract: loop nesting, token axes/tiles, projection,
+  attention/recurrent and expert shapes, and dispatch granularity:
+- Structural verification command, generated loop/shape evidence, and tokenwise
+  full-stack negative control:
 - Generation entry path and how it invokes compiled model forwards:
 - Required deliverables and acceptance rows (including documentation):
 - Original generation preflight, fixture-selection policy and frozen case IDs:
@@ -34,3 +38,11 @@
 ## Decisions for user agreement
 
 List concrete alternatives, recommendations, and outstanding facts here.
+
+Multi-token prefill must retain prompt-token tiles within layers. Necessary
+recurrent scans and token tiling are allowed; an outer token loop through the
+entire decoder stack is diagnostic-only by default. Performance tuning being
+excluded does not waive this requirement. Record any reduced tokenwise-only
+scope as an explicit user decision, never as an agent-authorized implementation
+choice. Distinguish within-prompt token processing from optional multi-request
+batching and external streaming prefill.

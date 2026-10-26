@@ -11,6 +11,11 @@ Independent semantic references are required; external parent review is not.
 | --- | --- | --- | --- |
 | Complete-model compiled prefill | TBD | TBD | Graph covers embedding, every layer, final norm, and head |
 | Complete-model compiled decode | TBD | TBD | Same coverage; consumes and updates agreed persistent state |
+| Prefill execution structure | TBD | TBD | Multi-token within-layer work; actual loop/shape evidence matches the frozen contract |
+| Structural check negative control | TBD | TBD | Tokenwise complete-stack prefill is rejected, including renamed entry wrappers |
+| First working paths | TBD | TBD | Attention and MoE/feed-forward structure checked before full-stack expansion |
+| Engineering structure | TBD | TBD | Current ownership/call graph follows model rules; validation exercises delivered symbols and variants |
+| Default validation and discovery | TBD | TBD | Bounded entries use existing harness/comparators and applicable CI discovery recognizes them |
 | Prefill-to-decode handoff | TBD | TBD | Actual compiled entries pass state and position checks |
 | Agreed shape and capacity limits | TBD | TBD | Supported boundaries pass; unsupported inputs follow the contract |
 | Real-weight mapping | TBD | TBD | All included weights mapped; exclusions and transforms justified |
@@ -23,6 +28,64 @@ Independent semantic references are required; external parent review is not.
 Record entry symbols, source hashes, compile commands, runtime invocation paths,
 and generated graph coverage. Placeholder files, aliases, Python per-operator
 submission loops, and compile-only success do not pass the model delivery gates.
+
+## Engineering gates
+
+Use the [model rules](../../../.claude/rules/models.md) as the canonical criteria.
+The owner records evidence in the existing `MODULES.md` and `TASKS.md`:
+
+- Before implementation: complete the file-ownership and validation map.
+- On the first working attention and MoE/feed-forward paths: inspect actual
+  dependencies, call depth, phase shapes, and default validation; resolve structural
+  findings before expanding the pattern to the full model. Check each distinct
+  mixer as it becomes executable.
+- At closeout: update the map, identify the exact symbols and variants called by
+  validation and composition, and account for obsolete paths and their consumers.
+  Execute the bounded default validation entries and applicable existing CI
+  discovery checks, recording commands, exit codes and discovered entries.
+
+An entry that validates another variant does not accept the delivered variant.
+Validate every delivered variant; retain other implementations only with an
+explicit consumer and their own acceptance evidence. Repository sources must
+contain the permanent validation code. Frozen fixture data and logs may remain
+in experiment artifacts. Reuse
+existing harness/comparator capabilities and add only missing model semantics.
+Ruff success, source hashes, or generation cannot substitute for these checks.
+Document permitted exceptions under the existing rules with actual consumers
+and responsibilities; unresolved violations keep the corresponding row open.
+
+## Execution-structure gates
+
+These gates are required even without performance targets. Freeze representative
+supported prefill lengths greater than one and a decode fixture. Inspect the
+actual source call paths and generated IR/task graphs after helper expansion.
+Record the following for every fixture and phase:
+
+- Source/build identity, entry symbol, command, and actual checker result.
+- Loop nesting and bounds; which loop encloses the complete decoder stack.
+- Logical token axes, token tiles, and effective projection, attention/recurrent,
+  feed-forward, and routed/shared-expert operand shapes.
+- State updates and dispatch/combine granularity, including worst-case MoE receives.
+- Evidence paths and locations supporting each conclusion; unknown evidence fails.
+
+Require token tiles greater than one in prefill projections and feed-forward
+work. Allow tiled scheduling and necessary causal/recurrent scans. Reject an
+outer prompt-token loop that executes the complete decoder stack per token;
+numerical equivalence, readable generation, and a compiled loop do not waive this
+gate. Two identical entry wrappers are not proof of phase specialization, while
+shared helpers with verified phase-dependent behavior are allowed.
+Count logical prompt tokens rather than heads or padding. Sparse expert groups
+may be empty or contain one row; require a repeated-expert fixture to demonstrate
+that the implementation can group multiple tokens for expert computation.
+
+Use the existing validation entry and inspection tools, adding only necessary
+model-specific checks, against the real compiled path and
+a deliberately tokenwise full-stack negative control. The latter must be
+rejected even after renaming the entry. Check generated shapes and nesting,
+not only source spelling, kernel names, or self-reported booleans. Missing or
+unrecognized evidence must not produce a pass. Save both actual results before
+complete-model generation. A tokenwise-only exception requires an explicit user
+scope decision and must remain visible in the final delivery status.
 
 ## Numerical gates
 
@@ -60,4 +123,6 @@ Map every agreed requirement to an actual result on the delivered revision in
 `TASKS.md`. Rerun affected gates after changes. Retain failures and label optional
 diagnostics separately. An unmet required row keeps the goal incomplete; continue
 when implementable. After all required rows pass, save the native goal completion
-result. Do not end with external parent acceptance pending.
+result. Engineering acceptance, structural acceptance and its negative control
+are required rows; module accuracy or generation cannot substitute for them.
+Do not end with external parent acceptance pending.
